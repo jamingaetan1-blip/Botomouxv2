@@ -1,0 +1,4 @@
+discord.py
+pytesseract
+pillow
+requests

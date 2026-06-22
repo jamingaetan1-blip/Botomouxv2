@@ -136,6 +136,13 @@ async def fmtotal(interaction: discord.Interaction):
         f"TOTAL : {format_number(total)} kamas"
     )
 
+
+@bot.command()
+async def sync(ctx):
+    await bot.tree.sync()
+    await ctx.send("Commandes synchronisees !")
+
+
 # ---------------- EVENTS ---------------- #
 
 @bot.event

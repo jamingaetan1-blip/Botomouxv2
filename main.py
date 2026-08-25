@@ -121,6 +121,71 @@ def empty_session():
         "active": True
     }
 
+# ---------------- TABLEAU RUNES ---------------- #
+def build_rune_table_rows(runes):
+    """
+    Construit les lignes d'un tableau aligne (colonnes : Rune, Qte,
+    Total Kamas, Cout moyen) a partir du dict de runes de la session.
+    Retourne (header_line, sep_line, rows) ou chaque element est une
+    chaine deja formatee/alignee, prete a etre jointe par des \n.
+    """
+    headers = ["Rune", "Qte", "Total Kamas", "Cout moyen"]
+    data_rows = []
+    for name, vals in runes.items():
+        qty = vals["qty"]
+        total = vals["price"]
+        avg = round(total / qty) if qty else 0
+        data_rows.append([name, str(qty), format_number(total), format_number(avg)])
+
+    col_widths = [len(h) for h in headers]
+    for row in data_rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+
+    def fmt(cells):
+        return "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(cells))
+
+    header_line = fmt(headers)
+    sep_line = "  ".join("-" * w for w in col_widths)
+    rows_fmt = [fmt(r) for r in data_rows]
+    return header_line, sep_line, rows_fmt
+
+def build_rune_table_text(runes):
+    """Tableau complet pret a etre insere dans un message (bloc de code)."""
+    if not runes:
+        return None
+    header_line, sep_line, rows_fmt = build_rune_table_rows(runes)
+    return "```\n" + header_line + "\n" + sep_line + "\n" + "\n".join(rows_fmt) + "\n```"
+
+async def send_rune_table(send_func, runes):
+    """
+    Envoie le tableau des runes, en le decoupant en plusieurs messages
+    s'il depasse la limite Discord (2000 caracteres), chaque morceau
+    reprenant l'en-tete pour rester lisible.
+    """
+    if not runes:
+        return
+    header_line, sep_line, rows_fmt = build_rune_table_rows(runes)
+    limit = 1900
+    base_len = len(header_line) + len(sep_line) + 20
+
+    chunks = []
+    current = []
+    current_len = base_len
+    for row in rows_fmt:
+        if current and current_len + len(row) + 1 > limit:
+            chunks.append(current)
+            current = []
+            current_len = base_len
+        current.append(row)
+        current_len += len(row) + 1
+    if current:
+        chunks.append(current)
+
+    for c in chunks:
+        body = "```\n" + header_line + "\n" + sep_line + "\n" + "\n".join(c) + "\n```"
+        await send_func(body)
+
 # ---------------- COMMANDES ---------------- #
 @bot.tree.command(name="fmstart", description="Demarrer une session FM")
 async def fmstart(interaction: discord.Interaction):

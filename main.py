@@ -121,70 +121,45 @@ def empty_session():
         "active": True
     }
 
-# ---------------- TABLEAU RUNES ---------------- #
-def build_rune_table_rows(runes):
+# ---------------- EMBED RUNES ---------------- #
+def build_rune_embeds(runes, title="Detail des runes"):
     """
-    Construit les lignes d'un tableau aligne (colonnes : Rune, Qte,
-    Total Kamas, Cout moyen) a partir du dict de runes de la session.
-    Retourne (header_line, sep_line, rows) ou chaque element est une
-    chaine deja formatee/alignee, prete a etre jointe par des \n.
+    Construit une (ou plusieurs, si +25 runes) liste d'embeds Discord,
+    un champ par rune en mode inline -> Discord les affiche automatiquement
+    en grille propre, sans les soucis d'alignement des blocs de code
+    (qui cassent sur mobile faute de defilement horizontal).
     """
-    headers = ["Rune", "Qte", "Total Kamas", "Cout moyen"]
-    data_rows = []
+    if not runes:
+        return []
+
+    embeds = []
+    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    field_count = 0
+
     for name, vals in runes.items():
         qty = vals["qty"]
         total = vals["price"]
         avg = round(total / qty) if qty else 0
-        data_rows.append([name, str(qty), format_number(total), format_number(avg)])
+        value = (
+            f"Qte : **{qty}**\n"
+            f"Total : **{format_number(total)}** kamas\n"
+            f"Moyenne : **{format_number(avg)}** kamas/u"
+        )
 
-    col_widths = [len(h) for h in headers]
-    for row in data_rows:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(cell))
+        if field_count == 25:
+            embeds.append(embed)
+            embed = discord.Embed(title=title, color=discord.Color.blurple())
+            field_count = 0
 
-    def fmt(cells):
-        return "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(cells))
+        embed.add_field(name=name, value=value, inline=True)
+        field_count += 1
 
-    header_line = fmt(headers)
-    sep_line = "  ".join("-" * w for w in col_widths)
-    rows_fmt = [fmt(r) for r in data_rows]
-    return header_line, sep_line, rows_fmt
+    embeds.append(embed)
+    return embeds
 
-def build_rune_table_text(runes):
-    """Tableau complet pret a etre insere dans un message (bloc de code)."""
-    if not runes:
-        return None
-    header_line, sep_line, rows_fmt = build_rune_table_rows(runes)
-    return "```\n" + header_line + "\n" + sep_line + "\n" + "\n".join(rows_fmt) + "\n```"
-
-async def send_rune_table(send_func, runes):
-    """
-    Envoie le tableau des runes, en le decoupant en plusieurs messages
-    s'il depasse la limite Discord (2000 caracteres), chaque morceau
-    reprenant l'en-tete pour rester lisible.
-    """
-    if not runes:
-        return
-    header_line, sep_line, rows_fmt = build_rune_table_rows(runes)
-    limit = 1900
-    base_len = len(header_line) + len(sep_line) + 20
-
-    chunks = []
-    current = []
-    current_len = base_len
-    for row in rows_fmt:
-        if current and current_len + len(row) + 1 > limit:
-            chunks.append(current)
-            current = []
-            current_len = base_len
-        current.append(row)
-        current_len += len(row) + 1
-    if current:
-        chunks.append(current)
-
-    for c in chunks:
-        body = "```\n" + header_line + "\n" + sep_line + "\n" + "\n".join(c) + "\n```"
-        await send_func(body)
+async def send_rune_embeds(send_func, runes, title="Detail des runes"):
+    for embed in build_rune_embeds(runes, title=title):
+        await send_func(embed=embed)
 
 # ---------------- COMMANDES ---------------- #
 @bot.tree.command(name="fmstart", description="Demarrer une session FM")
@@ -214,17 +189,12 @@ async def fmstop(interaction: discord.Interaction):
 
     message_out = f"Resume final\n\n{resume}\n\nTOTAL : {format_number(total)} kamas"
 
-    if runes:
-        rune_lines = "\n".join(
-            f"Rune {name} x{vals['qty']} {format_number(vals['price'])} Kamas"
-            for name, vals in runes.items()
-        )
-        message_out += f"\n\nDetail runes :\n{rune_lines}"
-
     del sessions[channel_id]
     save_data()
 
     await interaction.response.send_message(message_out)
+    if runes:
+        await send_rune_embeds(interaction.followup.send, runes)
 
 @bot.tree.command(name="fmreset", description="Reinitialiser la session")
 async def fmreset(interaction: discord.Interaction):
@@ -253,14 +223,9 @@ async def fmtotal(interaction: discord.Interaction):
 
     message_out = f"Etat actuel\n\n{resume}\n\nTOTAL : {format_number(total)} kamas"
 
-    if runes:
-        rune_lines = "\n".join(
-            f"Rune {name} x{vals['qty']} {format_number(vals['price'])} Kamas"
-            for name, vals in runes.items()
-        )
-        message_out += f"\n\nDetail runes :\n{rune_lines}"
-
     await interaction.response.send_message(message_out)
+    if runes:
+        await send_rune_embeds(interaction.followup.send, runes)
 
 @bot.command()
 async def sync(ctx):

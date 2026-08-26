@@ -1,0 +1,30 @@
+services:
+  botomoux:
+    # "build: ." dit a Docker Compose : "construis l'image toi-meme a
+    # partir du Dockerfile qui se trouve dans ce dossier". Ton ami n'a
+    # rien d'autre a faire, pas besoin de publier une image ailleurs.
+    build: .
+
+    container_name: botomoux
+
+    # Redemarre automatiquement le bot s'il crashe, ou si la machine
+    # de ton ami redemarre. "unless-stopped" = toujours redemarrer,
+    # sauf si quelqu'un l'arrete manuellement avec "docker compose stop".
+    restart: unless-stopped
+
+    # Le token Discord (et toute autre variable sensible) ne doit
+    # JAMAIS etre ecrit en dur dans le code ou dans ce fichier.
+    # env_file dit a Docker de lire les variables depuis un fichier
+    # .env a cote de ce docker-compose.yml (voir .env.example fourni).
+    env_file:
+      - .env
+
+    # Un volume relie un dossier/fichier de la machine hote a un
+    # dossier/fichier a l'interieur du conteneur. Sans ca, data.json
+    # (l'historique des sessions) serait perdu a chaque fois que le
+    # conteneur est recree (mise a jour, redemarrage du serveur...).
+    # Ici, ./data.json sur la machine de ton ami correspond a
+    # /app/data.json a l'interieur du conteneur (le WORKDIR defini
+    # dans le Dockerfile).
+    volumes:
+      - /docker/botomoux/data.json:/app/data.json

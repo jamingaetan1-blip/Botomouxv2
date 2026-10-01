@@ -451,8 +451,11 @@ async def archive_fm_channel(channel, message):
     entry = fm_channels().get(str(channel.id))
     if not entry or entry.get("status") != "active":
         return
+    # Un salon peut etre rouvert puis archive de nouveau : chaque archivage a ses propres identifiants
+    # d'evenement, sinon le site prendrait le second pour un doublon du premier.
+    archived_at = now_iso()
     if await close_session_in_channel(channel):
-        await send_event(site_event("session-stop", f"{channel.id}-archive-stop", channel))
+        await send_event(site_event("session-stop", f"{channel.id}-archive-stop-{archived_at}", channel))
 
     guild = channel.guild
     overwrites = dict(channel.overwrites)
@@ -467,10 +470,45 @@ async def archive_fm_channel(channel, message):
         overwrites=overwrites,
     )
     entry["status"] = "archived"
-    entry["archived_at"] = now_iso()
+    entry["archived_at"] = archived_at
     save_data()
     await channel.send(message)
-    await send_event(site_event("channel-archived", f"{channel.id}-archived", channel))
+    await send_event(site_event("channel-archived", f"{channel.id}-archived-{archived_at}", channel))
+
+# Rouvre un salon FM archive, a la demande du site (« Rouvrir » une seance de FM) : le meme salon
+# revient dans la categorie Forgemagie et son proprietaire peut de nouveau y ecrire. La session est
+# ouverte ensuite par la demande « open » du site.
+async def reopen_fm_channel(channel):
+    entry = fm_channels().get(str(channel.id))
+    if not entry:
+        raise ChannelError("Ce salon n'est pas un salon FM.")
+    if entry.get("status") == "active":
+        return
+    if len(active_channels_of(entry["owner_id"])) >= FM_MAX_ACTIVE_CHANNELS:
+        raise ChannelError(
+            f"Tu as deja {FM_MAX_ACTIVE_CHANNELS} salons FM actifs : archives-en un avec /fmarchive."
+        )
+    guild = channel.guild
+    category = fm_place(guild, "category_id", discord.CategoryChannel)
+    if category is None and await ensure_fm_places(guild):
+        category = fm_place(guild, "category_id", discord.CategoryChannel)
+
+    overwrites = dict(channel.overwrites)
+    owner = guild.get_member(int(entry["owner_id"]))
+    if owner is not None:
+        overwrites[owner] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, attach_files=True,
+            read_message_history=True, use_application_commands=True,
+        )
+    await channel.edit(category=category or channel.category, overwrites=overwrites)
+    reopened_at = now_iso()
+    entry["status"] = "active"
+    entry.pop("archived_at", None)
+    # Sans cela, l'archivage automatique pour inactivite le refermerait aussitot.
+    entry["last_activity"] = reopened_at
+    save_data()
+    await channel.send("Salon rouvert : la seance de FM reprend.")
+    await send_event(site_event("channel-reopened", f"{channel.id}-reopened-{reopened_at}", channel))
 
 class ChannelNameModal(discord.ui.Modal, title="Nouvelle séance de FM"):
     channel_name = discord.ui.TextInput(
@@ -662,7 +700,7 @@ async def sync(ctx):
 
 # ---------------- TACHES DE FOND ---------------- #
 # Toutes les 10 secondes : les demandes du site (ouvrir / fermer une session,
-# creer un salon), puis les envois qui avaient echoue.
+# creer, archiver ou rouvrir un salon), puis les envois qui avaient echoue.
 @tasks.loop(seconds=10)
 async def poll_site():
     await flush_pending_events()
@@ -677,6 +715,10 @@ async def poll_site():
     for command in data.get("commands", []):
         command_id = command["id"]
         if command_id in handled_commands:
+            continue
+        # Une demande d'un type que ce bot ne connait pas reste en attente : le site l'affiche comme
+        # « pas encore fait dans Discord » au lieu de la croire faite.
+        if command["type"] not in ("create-channel", "open", "close", "archive-channel", "reopen-channel"):
             continue
         status, error, channel_id = "done", None, None
         try:
@@ -704,6 +746,15 @@ async def poll_site():
                     )
                 elif command["type"] == "close" and channel is not None:
                     await close_session_in_channel(channel)
+                # « Archiver la seance » sur le site : comme /fmarchive. Salon deja archive ou
+                # introuvable : rien a faire.
+                elif command["type"] == "archive-channel" and channel is not None:
+                    await archive_fm_channel(channel, "Salon archive depuis le site : il reste consultable en lecture seule.")
+                # « Rouvrir » sur le site : le meme salon redevient actif.
+                elif command["type"] == "reopen-channel":
+                    if channel is None:
+                        raise ChannelError("Salon introuvable")
+                    await reopen_fm_channel(channel)
         except ChannelError as failure:
             status, error = "failed", str(failure)
         except discord.HTTPException as failure:

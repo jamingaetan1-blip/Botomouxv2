@@ -41,9 +41,10 @@ SITE_URL = os.environ.get("DOFUS_CRAFT_API_URL", "").rstrip("/")
 SITE_KEY = os.environ.get("FM_BOT_API_KEY", "")
 SITE_ENABLED = bool(SITE_URL and SITE_KEY)
 
-# Salons FM personnels : actives par FM_PERSONAL_CHANNELS=1. Le bot cree alors lui-meme
-# les categories "Forgemagie" et "Archives FM" et le salon d'accueil #forgemagie (ou reprend
-# ceux qui existent deja sous ces noms). Sinon, les commandes /fm... marchent comme avant.
+# Salons FM personnels : actives par FM_PERSONAL_CHANNELS=1. Sur chaque serveur ou il se
+# trouve, le bot cree alors lui-meme les categories "Forgemagie" et "Archives FM" et le salon
+# d'accueil #forgemagie (ou reprend ceux qui existent deja sous ces noms). Sinon, les
+# commandes /fm... marchent comme avant.
 def _int_env(name, default=0):
     try:
         return int(os.environ.get(name, default))
@@ -51,8 +52,6 @@ def _int_env(name, default=0):
         return default
 
 FM_PERSONAL_CHANNELS = os.environ.get("FM_PERSONAL_CHANNELS") == "1"
-# Seulement si le bot est sur plusieurs serveurs : celui ou creer les salons FM.
-FM_GUILD_ID = _int_env("FM_GUILD_ID")
 FM_MAX_ACTIVE_CHANNELS = _int_env("FM_MAX_ACTIVE_CHANNELS", 5)
 FM_INACTIVITY_DAYS = _int_env("FM_INACTIVITY_DAYS", 14)
 
@@ -321,38 +320,44 @@ def active_channels_of(user_id):
 class ChannelError(Exception):
     """Une creation de salon impossible, avec le message a montrer au joueur."""
 
-def fm_guild():
-    if not FM_PERSONAL_CHANNELS:
-        return None
-    if FM_GUILD_ID:
-        return bot.get_guild(FM_GUILD_ID)
-    return bot.guilds[0] if len(bot.guilds) == 1 else None
-
-# Un des emplacements des salons FM, retrouve par l'identifiant garde dans data.json.
-def fm_place(key, kind):
-    channel = bot.get_channel(int(fm_state().get(key) or 0))
-    return channel if isinstance(channel, kind) else None
-
-async def ensure_fm_places():
-    """Trouve ou cree les categories Forgemagie et Archives FM et le salon d'accueil."""
-    guild = fm_guild()
-    if guild is None:
-        print("[Salons FM] Serveur introuvable : indique FM_GUILD_ID si le bot est sur plusieurs serveurs")
-        return False
+# Les emplacements des salons FM d'un serveur (categories, salon et message d'accueil),
+# gardes dans data.json par serveur.
+def guild_state(guild):
     state = fm_state()
+    guilds = state.setdefault("guilds", {})
+    # Ancien format (un seul serveur) : les emplacements sont ranges sous leur serveur.
+    if "category_id" in state or "welcome_channel_id" in state:
+        old = {key: state.pop(key) for key in list(state) if key in PLACE_KEYS}
+        channel = bot.get_channel(int(old.get("welcome_channel_id") or old.get("category_id") or 0))
+        if channel is not None:
+            guilds.setdefault(str(channel.guild.id), old)
+    return guilds.setdefault(str(guild.id), {})
+
+PLACE_KEYS = ("category_id", "archive_category_id", "welcome_channel_id", "welcome_message_id", "welcome_version", "welcome_emoji")
+
+# Un des emplacements des salons FM d'un serveur, retrouve par l'identifiant garde dans data.json.
+def fm_place(guild, key, kind):
+    channel = bot.get_channel(int(guild_state(guild).get(key) or 0))
+    if not isinstance(channel, kind) or channel.guild != guild:
+        return None
+    return channel
+
+async def ensure_fm_places(guild):
+    """Trouve ou cree, sur ce serveur, les categories Forgemagie et Archives FM et le salon d'accueil."""
+    state = guild_state(guild)
     try:
-        category = fm_place("category_id", discord.CategoryChannel)
+        category = fm_place(guild, "category_id", discord.CategoryChannel)
         if category is None:
             category = (discord.utils.get(guild.categories, name=FM_CATEGORY_NAME)
                         or await guild.create_category(FM_CATEGORY_NAME))
             state["category_id"] = str(category.id)
 
-        if fm_place("archive_category_id", discord.CategoryChannel) is None:
+        if fm_place(guild, "archive_category_id", discord.CategoryChannel) is None:
             archive = (discord.utils.get(guild.categories, name=FM_ARCHIVE_CATEGORY_NAME)
                        or await guild.create_category(FM_ARCHIVE_CATEGORY_NAME))
             state["archive_category_id"] = str(archive.id)
 
-        if fm_place("welcome_channel_id", discord.TextChannel) is None:
+        if fm_place(guild, "welcome_channel_id", discord.TextChannel) is None:
             welcome = discord.utils.get(guild.text_channels, name=FM_WELCOME_CHANNEL_NAME)
             if welcome is None:
                 # Lecture seule pour tout le monde : on n'y fait que cliquer sur le bouton.
@@ -371,11 +376,20 @@ async def ensure_fm_places():
                 )
             state["welcome_channel_id"] = str(welcome.id)
     except discord.Forbidden:
-        print("[Salons FM] Le bot n'a pas la permission \"Gerer les salons\" : salons FM desactives")
+        print(f"[Salons FM] Sur le serveur \"{guild.name}\", le bot n'a pas la permission \"Gerer les salons\" : salons FM desactives")
         return False
     finally:
         save_data()
     return True
+
+# Met en place les salons FM d'un serveur : au demarrage, et quand le bot rejoint un serveur.
+async def setup_guild(guild):
+    if not await ensure_fm_places(guild):
+        return
+    try:
+        await ensure_welcome_message(guild)
+    except discord.HTTPException as error:
+        print(f"[Salons FM] Message d'accueil impossible sur \"{guild.name}\" : {error}")
 
 async def create_fm_channel(guild, member, raw_name, command_id=None):
     if not FM_PERSONAL_CHANNELS:
@@ -388,9 +402,9 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
             f"Tu as deja {FM_MAX_ACTIVE_CHANNELS} salons FM actifs : archives-en un avec /fmarchive."
         )
     # Categorie supprimee entre-temps : le bot la recree.
-    category = fm_place("category_id", discord.CategoryChannel)
-    if category is None and await ensure_fm_places():
-        category = fm_place("category_id", discord.CategoryChannel)
+    category = fm_place(guild, "category_id", discord.CategoryChannel)
+    if category is None and await ensure_fm_places(guild):
+        category = fm_place(guild, "category_id", discord.CategoryChannel)
     if category is None:
         raise ChannelError("La categorie Forgemagie n'a pas pu etre creee.")
 
@@ -445,9 +459,9 @@ async def archive_fm_channel(channel, message):
     owner = guild.get_member(int(entry["owner_id"]))
     if owner is not None:
         overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
-    archive = fm_place("archive_category_id", discord.CategoryChannel)
-    if archive is None and await ensure_fm_places():
-        archive = fm_place("archive_category_id", discord.CategoryChannel)
+    archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
+    if archive is None and await ensure_fm_places(guild):
+        archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
     await channel.edit(
         category=archive or channel.category,
         overwrites=overwrites,
@@ -553,11 +567,11 @@ def welcome_embed():
     embed.set_footer(text="Illustration © Ankama")
     return embed
 
-async def ensure_welcome_message():
-    channel = fm_place("welcome_channel_id", discord.TextChannel)
+async def ensure_welcome_message(guild):
+    channel = fm_place(guild, "welcome_channel_id", discord.TextChannel)
     if channel is None:
         return
-    state = fm_state()
+    state = guild_state(guild)
     message_id = state.get("welcome_message_id")
     if message_id:
         try:
@@ -667,9 +681,10 @@ async def poll_site():
         status, error, channel_id = "done", None, None
         try:
             if command["type"] == "create-channel":
-                guild = fm_guild()
+                # Le site indique son serveur Discord (celui dont ses joueurs sont membres).
+                guild = bot.get_guild(int(command.get("guildId") or 0))
                 if guild is None:
-                    raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
+                    raise ChannelError("Le bot n'est pas sur le serveur Discord du site.")
                 member = await guild.fetch_member(int(command["player"]["id"]))
                 channel = await create_fm_channel(guild, member, command["name"], command_id)
                 channel_id = channel.id
@@ -723,29 +738,36 @@ async def on_ready():
     load_data()
     await bot.tree.sync()
     print(f"Bot connecte en tant que {bot.user}")
-    if FM_PERSONAL_CHANNELS and await ensure_fm_places():
+    if FM_PERSONAL_CHANNELS:
         await ensure_button_emoji()
-        await ensure_welcome_message()
+        for guild in bot.guilds:
+            await setup_guild(guild)
         if not archive_inactive_channels.is_running():
             archive_inactive_channels.start()
     if SITE_ENABLED and not poll_site.is_running():
         poll_site.start()
 
+# Le bot est ajoute a un serveur : il y cree ses salons FM.
+@bot.event
+async def on_guild_join(guild):
+    if FM_PERSONAL_CHANNELS:
+        await setup_guild(guild)
+
 @bot.event
 async def on_member_remove(member):
     for channel_id in active_channels_of(member.id):
         channel = bot.get_channel(int(channel_id))
-        if channel is not None:
+        if channel is not None and channel.guild == member.guild:
             await archive_fm_channel(channel, f"Salon archive : {member.display_name} a quitte le serveur.")
 
 @bot.event
 async def on_guild_channel_delete(channel):
     # Salon d'accueil ou categorie supprime : le bot les recree aussitot.
+    places = guild_state(channel.guild)
     if FM_PERSONAL_CHANNELS and str(channel.id) in (
-        fm_state().get("welcome_channel_id"), fm_state().get("category_id"), fm_state().get("archive_category_id"),
+        places.get("welcome_channel_id"), places.get("category_id"), places.get("archive_category_id"),
     ):
-        if await ensure_fm_places():
-            await ensure_welcome_message()
+        await setup_guild(channel.guild)
         return
     entry = fm_channels().get(str(channel.id))
     if entry:

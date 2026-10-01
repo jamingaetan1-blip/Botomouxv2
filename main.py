@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 import pytesseract
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageStat
 import requests
 from io import BytesIO
 import asyncio
@@ -29,8 +29,20 @@ sessions = {}
 TESS_LANG = "fra"
 
 # Repère les lignes du type : "100 x [Rune Cri] (235 999 kamas)"
-LINE_PATTERN = re.compile(
-    r'(\d[\d\s]{0,6})\s*x\s*\[([^\]]{2,40})\]\s*\(?\s*(\d[\d\s]{2,12})\s*kamas\)?',
+# Applique ligne par ligne (jamais sur tout le texte d'un coup) pour
+# qu'un chiffre d'une ligne ne puisse jamais "deborder" sur la ligne
+# suivante et fausser une quantite.
+STRICT_PATTERN = re.compile(
+    r'(\d[\d ]{0,6})\s*x\s*\[([^\]]{2,40})\]\s*\(?\s*(\d[\d ]{2,12})\s*kamas\)?',
+    re.IGNORECASE
+)
+
+# Filet de securite : si les crochets [ ] n'ont pas ete lus par l'OCR
+# (ce qui peut arriver sur certains caracteres speciaux/accentues),
+# on retente sans exiger les crochets, en se basant uniquement sur
+# "x ... ( ... kamas )".
+LOOSE_PATTERN = re.compile(
+    r'(\d[\d ]{0,6})\s*x\s*[\[\{]?\s*([^()\[\]]{2,40}?)\s*[\]\}]?\s*\(\s*(\d[\d ]{2,12})\s*kamas\)?',
     re.IGNORECASE
 )
 
@@ -108,11 +120,13 @@ def preprocess_image(img: Image.Image, scale: int = 3) -> Image.Image:
     img = img.resize((w * scale, h * scale), Image.LANCZOS)
     img = ImageOps.autocontrast(img)
     img = img.filter(ImageFilter.SHARPEN)
-    img = img.point(lambda p: 255 if p > 150 else 0)
+
+    threshold = ImageStat.Stat(img).mean[0]
+    img = img.point(lambda p: 255 if p > threshold else 0)
     return img
 
 def clean_number(raw: str) -> int:
-    cleaned = raw.replace(" ", "").replace(" ", "").replace("\xa0", "")
+    cleaned = raw.replace(" ", "").replace(" ", "").replace(" ", "")
     return int(cleaned)
 
 # ---------------- EXTRACTION ---------------- #
@@ -130,23 +144,60 @@ def extract_kamas(text):
 
 def extract_runes(text):
     """
-    Retourne une liste de dicts {name, qty, price} pour chaque ligne
-    du type '100 x [Rune Cri] (235 999 kamas)' trouvee dans le texte OCR.
+    Retourne (results, orphan_lines).
+
+    results : liste de dicts {name, qty, price}, une entree par ligne
+    OCR reconnue comme un achat de rune.
+
+    orphan_lines : lignes qui contiennent "kamas" mais qu'aucun des
+    deux patterns n'a reussi a parser -> utile pour voir rapidement
+    pourquoi une ligne a ete ratee (au lieu de deviner).
+
+    Important : on traite le texte LIGNE PAR LIGNE (jamais le texte
+    entier d'un bloc) pour qu'un chiffre d'une ligne ne puisse jamais
+    se mélanger a la ligne suivante.
     """
     results = []
-    for m in LINE_PATTERN.finditer(text):
-        raw_qty, name, raw_price = m.groups()
-        try:
-            qty = clean_number(raw_qty)
-            price = clean_number(raw_price)
-        except ValueError:
+    orphan_lines = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        results.append({
-            "name": re.sub(r'\s+', ' ', name.strip()),
-            "qty": qty,
-            "price": price,
-        })
-    return results
+
+        # On neutralise d'eventuels horodatages parasites (ex: "12:38")
+        # qui pourraient se glisser juste avant la quantite et la fausser.
+        cleaned = re.sub(r'\[?\d{1,2}:\d{2}\]?', ' ', line)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        match = STRICT_PATTERN.search(cleaned)
+        if not match:
+            match = LOOSE_PATTERN.search(cleaned)
+
+        if match:
+            raw_qty, name, raw_price = match.groups()
+            try:
+                qty = clean_number(raw_qty)
+                price = clean_number(raw_price)
+            except ValueError:
+                if "kamas" in cleaned.lower():
+                    orphan_lines.append(line)
+                continue
+
+            clean_name = re.sub(r'\s+', ' ', name.strip(" []{}()"))
+            if not clean_name:
+                orphan_lines.append(line)
+                continue
+
+            results.append({
+                "name": clean_name,
+                "qty": qty,
+                "price": price,
+            })
+        elif "kamas" in cleaned.lower():
+            orphan_lines.append(line)
+
+    return results, orphan_lines
 
 def format_number(n):
     return f"{n:,}".replace(",", " ")
@@ -156,14 +207,27 @@ async def process_image(url):
     raw_img = Image.open(BytesIO(response.content))
     img = preprocess_image(raw_img)
 
-    # --psm 6 = on suppose un bloc de texte uniforme (liste de lignes).
-    # Si les captures ont une mise en page differente, essaie --psm 4.
-    config = "--psm 6"
-    text = pytesseract.image_to_string(img, lang=TESS_LANG, config=config)
+    def run_ocr(psm):
+        config = f"--psm {psm}"
+        return pytesseract.image_to_string(img, lang=TESS_LANG, config=config)
 
+    # --psm 6 = on suppose un bloc de texte uniforme (liste de lignes).
+    text = run_ocr(6)
+    runes, orphans = extract_runes(text)
     values = extract_kamas(text)
-    runes = extract_runes(text)
-    return values, runes
+
+    # Si on n'a trouve aucune rune alors qu'il y a visiblement des
+    # montants en kamas dans le texte, on retente avec un autre mode
+    # de segmentation de page (utile si la capture a une mise en page
+    # differente d'une simple liste, ex: colonnes, grille d'objets...).
+    if not runes and (values or orphans):
+        text2 = run_ocr(4)
+        runes2, orphans2 = extract_runes(text2)
+        if runes2:
+            runes, orphans = runes2, orphans2
+            values = extract_kamas(text2)
+
+    return values, runes, orphans
 
 def empty_session():
     return {
@@ -849,10 +913,11 @@ async def on_message(message):
         rune_totals = defaultdict(lambda: {"qty": 0, "price": 0})
         # Chaque ligne lue, avant regroupement : c'est ce que le site recoit.
         all_lines = []
+        all_orphans = []
 
         for attachment in message.attachments:
             if attachment.filename.lower().endswith(("png", "jpg", "jpeg")):
-                values, runes = await process_image(attachment.url)
+                values, runes, orphans = await process_image(attachment.url)
 
                 for v in values:
                     added_total += v
@@ -862,6 +927,8 @@ async def on_message(message):
                     rune_totals[r["name"]]["qty"] += r["qty"]
                     rune_totals[r["name"]]["price"] += r["price"]
                     all_lines.append(r)
+
+                all_orphans.extend(orphans)
 
         if added_total > 0:
             session["total"] += added_total
@@ -895,6 +962,19 @@ async def on_message(message):
                 f"Capture traitee :\n{detail_text}\n\n"
                 f"{message.author.mention} -> +{format_number(added_total)}\n"
                 f"Total global : {format_number(session['total'])}"
+            )
+
+        if all_orphans:
+            # Debug : des lignes contenaient "kamas" mais n'ont pas pu
+            # etre rattachees a une rune. Affiche les premieres pour
+            # pouvoir ajuster le format si besoin, sans avoir a deviner.
+            shown = all_orphans[:10]
+            orphan_text = "\n".join(f"• {o}" for o in shown)
+            extra = ""
+            if len(all_orphans) > len(shown):
+                extra = f"\n(+{len(all_orphans) - len(shown)} autre(s) non affichee(s))"
+            reply_parts.append(
+                f"⚠️ Lignes non reconnues comme rune :\n{orphan_text}{extra}"
             )
 
         if reply_parts:

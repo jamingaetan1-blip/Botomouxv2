@@ -1,7 +1,8 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import pytesseract
-from PIL import Image, ImageOps, ImageFilter, ImageStat
+from PIL import Image, ImageOps, ImageStat
 import requests
 from io import BytesIO
 import asyncio
@@ -10,7 +11,9 @@ import re
 import json
 import os
 import unicodedata
-from collections import defaultdict
+import hashlib
+from decimal import Decimal, InvalidOperation
+from collections import defaultdict, Counter
 
 # ---------------- CONFIG ---------------- #
 intents = discord.Intents.default()
@@ -28,23 +31,31 @@ sessions = {}
 # la lecture des chiffres, juste un peu moins bon sur le texte).
 TESS_LANG = "fra"
 
-# Repère les lignes du type : "100 x [Rune Cri] (235 999 kamas)"
-# Applique ligne par ligne (jamais sur tout le texte d'un coup) pour
-# qu'un chiffre d'une ligne ne puisse jamais "deborder" sur la ligne
-# suivante et fausser une quantite.
-STRICT_PATTERN = re.compile(
-    r'(\d[\d ]{0,6})\s*x\s*\[([^\]]{2,40})\]\s*\(?\s*(\d[\d ]{2,12})\s*kamas\)?',
-    re.IGNORECASE
-)
+# Double lecture de chaque capture (la meme image lue a deux echelles differentes). Une capture
+# n'est ajoutee automatiquement que si les DEUX lectures donnent exactement les memes lignes.
+# Mettre FM_DOUBLE_READ=0 pour la desactiver (non recommande : c'est un filet de securite).
+DOUBLE_READ = os.environ.get("FM_DOUBLE_READ", "1") != "0"
+OCR_CONFIG = "--psm 6"
+# Echelles d'agrandissement des deux lectures (mesurees : la paire 3 + 4 est la plus fiable).
+READ_SCALES = (3, 4)
 
-# Filet de securite : si les crochets [ ] n'ont pas ete lus par l'OCR
-# (ce qui peut arriver sur certains caracteres speciaux/accentues),
-# on retente sans exiger les crochets, en se basant uniquement sur
-# "x ... ( ... kamas )".
-LOOSE_PATTERN = re.compile(
-    r'(\d[\d ]{0,6})\s*x\s*[\[\{]?\s*([^()\[\]]{2,40}?)\s*[\]\}]?\s*\(\s*(\d[\d ]{2,12})\s*kamas\)?',
-    re.IGNORECASE
+# Une ligne d'achat VALIDE ressemble EXACTEMENT a :   1 000 x [Pepite] (433 166 kamas)
+# - la quantite est un nombre bien forme ("1 000" oui, "5 1" non : ca evite de fabriquer
+#   une quantite a partir de chiffres parasites) ;
+# - l'objet est entre crochets ;
+# - le prix est suivi de "kamas" ;
+# - AUCUN chiffre ni lettre en dehors de ca (seule la ponctuation parasite est toleree).
+# Tout ce qui s'en ecarte n'est jamais devine : la ligne est classee "douteuse".
+_QTY = r'(\d{1,3}(?: \d{3})+|\d{1,7})'
+_PRICE = r'(\d{1,3}(?: \d{3})+|\d{1,12})'
+PURCHASE_LINE = re.compile(
+    r'^[^\w\[\]()]*' + _QTY + r'\s*[xX\u00d7]\s*\[([^\[\]]{2,60})\]\s*\(?\s*' + _PRICE
+    + r'\s*kamas\s*\)?[^\w\[\]()]*$',
+    re.IGNORECASE,
 )
+ITEM_BRACKET = re.compile(r'\[[^\[\]]*\]')
+KAMAS_WORD = re.compile(r'kamas', re.IGNORECASE)
+LOOKS_LIKE_PURCHASE = re.compile(r'\d\s*[xX\u00d7]\s')
 
 # ---------------- CONFIG DOFUS CRAFT (facultative) ---------------- #
 # Envoi des sessions au site Dofus Craft. Sans ces deux variables, le bot
@@ -108,132 +119,133 @@ def touch_channel(channel_id):
 # ---------------- PRETRAITEMENT IMAGE ---------------- #
 def preprocess_image(img: Image.Image, scale: int = 3) -> Image.Image:
     """
-    Ameliore la lisibilite d'une capture avant l'OCR :
-    - passage en niveaux de gris
-    - agrandissement (les petits caracteres sont la 1ere cause de
-      confusion 6/8, 0/8, 5/6...)
-    - renforcement du contraste + nettete
-    - seuillage noir/blanc pour detacher nettement le texte du fond
+    Prepare une capture pour l'OCR : niveaux de gris, agrandissement, contraste, et
+    inversion sur fond sombre (texte fonce sur fond clair = ce que Tesseract lit le mieux).
+    Pas de binarisation : mesuree sur des captures de test, elle detruit la forme des
+    chiffres (ombre portee, JPEG) et provoque justement les confusions 6/8, 1/2...
     """
-    img = img.convert("L")
-    w, h = img.size
-    img = img.resize((w * scale, h * scale), Image.LANCZOS)
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
-
-    threshold = ImageStat.Stat(img).mean[0]
-    img = img.point(lambda p: 255 if p > threshold else 0)
-    return img
+    g = img.convert("L")
+    w, h = g.size
+    g = g.resize((w * scale, h * scale), Image.LANCZOS)
+    g = ImageOps.autocontrast(g)
+    if ImageStat.Stat(g).mean[0] < 128:
+        g = ImageOps.invert(g)
+    return g
 
 def clean_number(raw: str) -> int:
     cleaned = raw.replace(" ", "").replace(" ", "").replace(" ", "")
     return int(cleaned)
 
-# ---------------- EXTRACTION ---------------- #
-def extract_kamas(text):
-    matches = re.findall(r'(\d[\d\s]*)\s*kamas', text, re.IGNORECASE)
-    values = []
-    for match in matches:
-        try:
-            value = clean_number(match)
-        except ValueError:
-            continue
-        if value > 1000:  # filtre anti erreur OCR
-            values.append(value)
-    return values
-
-def extract_runes(text):
-    """
-    Retourne (results, orphan_lines).
-
-    results : liste de dicts {name, qty, price}, une entree par ligne
-    OCR reconnue comme un achat de rune.
-
-    orphan_lines : lignes qui contiennent "kamas" mais qu'aucun des
-    deux patterns n'a reussi a parser -> utile pour voir rapidement
-    pourquoi une ligne a ete ratee (au lieu de deviner).
-
-    Important : on traite le texte LIGNE PAR LIGNE (jamais le texte
-    entier d'un bloc) pour qu'un chiffre d'une ligne ne puisse jamais
-    se mélanger a la ligne suivante.
-    """
-    results = []
-    orphan_lines = []
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # On neutralise d'eventuels horodatages parasites (ex: "12:38")
-        # qui pourraient se glisser juste avant la quantite et la fausser.
-        cleaned = re.sub(r'\[?\d{1,2}:\d{2}\]?', ' ', line)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
-        match = STRICT_PATTERN.search(cleaned)
-        if not match:
-            match = LOOSE_PATTERN.search(cleaned)
-
-        if match:
-            raw_qty, name, raw_price = match.groups()
-            try:
-                qty = clean_number(raw_qty)
-                price = clean_number(raw_price)
-            except ValueError:
-                if "kamas" in cleaned.lower():
-                    orphan_lines.append(line)
-                continue
-
-            clean_name = re.sub(r'\s+', ' ', name.strip(" []{}()"))
-            if not clean_name:
-                orphan_lines.append(line)
-                continue
-
-            results.append({
-                "name": clean_name,
-                "qty": qty,
-                "price": price,
-            })
-        elif "kamas" in cleaned.lower():
-            orphan_lines.append(line)
-
-    return results, orphan_lines
-
+# ---------------- LECTURE D'UNE CAPTURE ---------------- #
 def format_number(n):
     return f"{n:,}".replace(",", " ")
 
-async def process_image(url):
-    response = requests.get(url)
-    raw_img = Image.open(BytesIO(response.content))
-    img = preprocess_image(raw_img)
+def normalize_ocr_line(raw):
+    line = raw.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ")
+    # Horodatage du chat ("[12:38]", crochets lus ou non) : on l'enleve, sinon ses crochets
+    # seraient pris pour un objet et ses chiffres pour une quantite.
+    line = re.sub(r"\[?\s*\d{1,2}\s*:\s*\d{2}\s*\]?", " ", line)
+    # Separateur de milliers lu "." ou "," (20.250 -> 20 250). Les kamas sont entiers :
+    # un point suivi de 3 chiffres ne peut etre qu'un separateur de milliers.
+    line = re.sub(r"(?<=\d)[.,](?=\d{3}(?!\d))", " ", line)
+    return re.sub(r"\s+", " ", line).strip()
 
-    def run_ocr(psm):
-        config = f"--psm {psm}"
-        return pytesseract.image_to_string(img, lang=TESS_LANG, config=config)
+def entry_label(e):
+    return f"{format_number(e['qty'])} x [{e['name']}] ({format_number(e['price'])} kamas)"
 
-    # --psm 6 = on suppose un bloc de texte uniforme (liste de lignes).
-    text = run_ocr(6)
-    runes, orphans = extract_runes(text)
-    values = extract_kamas(text)
+def entry_key(e):
+    return (re.sub(r"\s+", " ", e["name"]).casefold(), e["qty"], e["price"])
 
-    # Si on n'a trouve aucune rune alors qu'il y a visiblement des
-    # montants en kamas dans le texte, on retente avec un autre mode
-    # de segmentation de page (utile si la capture a une mise en page
-    # differente d'une simple liste, ex: colonnes, grille d'objets...).
-    if not runes and (values or orphans):
-        text2 = run_ocr(4)
-        runes2, orphans2 = extract_runes(text2)
-        if runes2:
-            runes, orphans = runes2, orphans2
-            values = extract_kamas(text2)
+def parse_capture_text(text):
+    """
+    Retourne (entries, rejects).
+    entries : lignes d'achat lues SANS ambiguite -> {name, qty, price}.
+    rejects : lignes qui ressemblent a un achat (crochet, "N x", "kamas") mais qui ne
+              respectent pas EXACTEMENT le format. Elles ne sont JAMAIS comptees ni
+              corrigees automatiquement : elles declenchent une verification humaine.
+    Le texte est traite ligne par ligne : un chiffre ne passe jamais d'une ligne a l'autre.
+    """
+    entries, rejects = [], []
+    for raw in text.splitlines():
+        line = normalize_ocr_line(raw)
+        if not line:
+            continue
+        brackets = len(ITEM_BRACKET.findall(line))
+        kamas = len(KAMAS_WORD.findall(line))
+        if brackets == 0 and kamas == 0:
+            continue  # autre ligne du chat, sans rapport avec un achat
+        if (brackets == 0 and "[" not in line and "]" not in line
+                and not LOOKS_LIKE_PURCHASE.search(line)):
+            continue  # ex. "Vous avez recu 5 000 kamas" : pas un achat d'objet
+        m = PURCHASE_LINE.match(line)
+        if m and brackets == 1 and kamas == 1:
+            qty = int(m.group(1).replace(" ", ""))
+            price = int(m.group(3).replace(" ", ""))
+            name = re.sub(r"\s+", " ", m.group(2)).strip()
+            if qty >= 1 and price >= 1 and name:
+                entries.append({"name": name, "qty": qty, "price": price})
+                continue
+        rejects.append(raw.strip())
+    return entries, rejects
 
-    return values, runes, orphans
+def analyze_capture_bytes(content):
+    """
+    Lit une image et dit si on peut s'y fier.
+    Retourne {"entries": [...], "doubts": [...], "hash": "..."}.
+    L'image est lue a deux echelles ; elle n'est acceptee automatiquement que si les deux
+    lectures sont propres ET donnent exactement les memes lignes (doubts vide).
+    """
+    img = Image.open(BytesIO(content))
+    img.load()
+    digest = hashlib.sha256(content).hexdigest()
+
+    scales = READ_SCALES if DOUBLE_READ else READ_SCALES[:1]
+    reads = []
+    for scale in scales:
+        text = pytesseract.image_to_string(preprocess_image(img, scale), lang=TESS_LANG, config=OCR_CONFIG)
+        entries_i, rejects_i = parse_capture_text(text)
+        reads.append({"text": text, "entries": entries_i, "rejects": rejects_i})
+
+    best = min(reads, key=lambda r: len(r["rejects"]))  # lecture la plus propre (1ere en cas d'egalite)
+    doubts = []
+    seen_rejects = []
+    for r in reads:
+        for line in r["rejects"]:
+            if line not in seen_rejects:
+                seen_rejects.append(line)
+    for line in seen_rejects:
+        doubts.append(f"ligne non reconnue : {line[:100]}")
+
+    if len(reads) > 1:
+        counters = [Counter(entry_key(e) for e in r["entries"]) for r in reads]
+        labels = {entry_key(e): entry_label(e) for r in reads for e in r["entries"]}
+        unstable = []
+        for other in counters[1:]:
+            for key in list((counters[0] - other).elements()) + list((other - counters[0]).elements()):
+                if key not in unstable:
+                    unstable.append(key)
+        for key in unstable:
+            doubts.append(f"ligne lue de façon instable : {labels[key]}")
+
+    if doubts:
+        # Aide au diagnostic dans les logs de l'hote (docker compose logs).
+        print("[OCR] capture douteuse, textes bruts lus :")
+        for i, r in enumerate(reads, 1):
+            print(f"--- lecture {i} ---\n{r['text']}")
+    return {"entries": best["entries"], "doubts": doubts, "hash": digest}
+
+def analyze_capture_url(url):
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    return analyze_capture_bytes(response.content)
 
 def empty_session():
     return {
         "total": 0,
         "users": {},
         "runes": {},
+        "payments": [],
+        "seen": [],
         "active": True
     }
 
@@ -277,6 +289,63 @@ async def send_rune_embeds(send_func, runes, title="Detail des runes"):
     for embed in build_rune_embeds(runes, title=title):
         await send_func(embed=embed)
 
+# ---------------- PAIEMENTS ---------------- #
+# "total" reste toujours le montant BRUT depense. Les paiements du client s'en deduisent :
+# reste a payer = total - paiements. Les sessions anciennes (sans "payments") restent valides.
+def payments_of(session):
+    return session.get("payments") or []
+
+def paid_total(session):
+    return sum(p["amount"] for p in payments_of(session))
+
+def amount_due(session):
+    return session["total"] - paid_total(session)
+
+_AMOUNT_RE = re.compile(r"^([\d\s.,]+?)\s*(kk|k|m)?\s*(?:kamas?)?$", re.IGNORECASE)
+_PLAIN_INT = re.compile(r"^\d+$")
+_GROUPED_INT = re.compile(r"^\d{1,3}(?:[ .,]\d{3})+$")
+_DECIMAL = re.compile(r"^\d+(?:[.,]\d+)?$")
+_AMOUNT_SUFFIX = {"k": 1_000, "m": 1_000_000, "kk": 1_000_000}
+
+def parse_kamas_amount(raw):
+    """
+    Lit un montant ecrit par un humain. Retourne un entier > 0, ou None si ambigu.
+    Accepte : 20000000 | 20 000 000 | 20.000.000 | 20M | 20m | 20kk | 1.5M | 1,5M | 500k
+    Sans suffixe, "." et "," ne sont que des separateurs de milliers (20.5 est refuse
+    plutot que lu "205"). Avec suffixe, ils sont la virgule decimale.
+    """
+    text = (raw or "").replace("\u00a0", " ").replace("\u202f", " ").strip().lower()
+    m = _AMOUNT_RE.match(text)
+    if not m:
+        return None
+    number, suffix = m.group(1).strip(), (m.group(2) or "")
+    if not number:
+        return None
+    try:
+        if suffix:
+            compact = number.replace(" ", "")
+            if not _DECIMAL.match(compact):
+                return None
+            value = Decimal(compact.replace(",", ".")) * _AMOUNT_SUFFIX[suffix]
+        elif _PLAIN_INT.match(number):
+            value = Decimal(number)
+        elif _GROUPED_INT.match(number):
+            value = Decimal(re.sub(r"[ .,]", "", number))
+        else:
+            return None
+    except InvalidOperation:
+        return None
+    if value <= 0 or value != value.to_integral_value():
+        return None
+    return int(value)
+
+def _payment_when(payment):
+    try:
+        ts = int(datetime.datetime.fromisoformat(payment["at"]).timestamp())
+        return f"<t:{ts}:f>"
+    except (KeyError, ValueError, TypeError):
+        return "date inconnue"
+
 # Texte du resume d'une session, commun a /fmstop, /fmtotal, a la fermeture
 # demandee par le site et a /fmarchive.
 def session_summary(session, title):
@@ -287,7 +356,155 @@ def session_summary(session, title):
         )
     else:
         resume = "Aucune donnee."
-    return f"{title}\n\n{resume}\n\nTOTAL : {format_number(session['total'])} kamas"
+    text = f"{title}\n\n{resume}\n\n"
+    payments = payments_of(session)
+    if not payments:
+        return text + f"TOTAL : {format_number(session['total'])} kamas"
+
+    lines = [
+        f"TOTAL DÉPENSÉ : {format_number(session['total'])} kamas",
+        f"Paiements reçus ({len(payments)}) : -{format_number(paid_total(session))} kamas",
+    ]
+    for p in payments[-10:]:
+        lines.append(f"  • -{format_number(p['amount'])} kamas ({_payment_when(p)})")
+    if len(payments) > 10:
+        lines.append(f"  (+{len(payments) - 10} paiement(s) plus ancien(s))")
+    due = amount_due(session)
+    if due >= 0:
+        lines.append(f"RESTE À PAYER : {format_number(due)} kamas")
+    else:
+        lines.append(f"TROP-PERÇU (crédit client) : {format_number(-due)} kamas")
+    return text + "\n".join(lines)
+
+# ---------------- ENREGISTREMENT D'UNE CAPTURE ---------------- #
+def aggregate_entries(entries):
+    agg = {}
+    for e in entries:
+        v = agg.setdefault(e["name"], {"qty": 0, "price": 0})
+        v["qty"] += e["qty"]
+        v["price"] += e["price"]
+    return agg
+
+def commit_entries(session, channel_id, author, entries, hashes):
+    """SEUL endroit ou une capture modifie les totaux. Retourne le montant ajoute."""
+    added = sum(e["price"] for e in entries)
+    session["total"] += added
+    uid = str(author.id)
+    session["users"][uid] = session["users"].get(uid, 0) + added
+    runes = session.setdefault("runes", {})
+    for name, vals in aggregate_entries(entries).items():
+        r = runes.setdefault(name, {"qty": 0, "price": 0})
+        r["qty"] += vals["qty"]
+        r["price"] += vals["price"]
+    seen = session.setdefault("seen", [])
+    for h in hashes:
+        if h and h not in seen:
+            seen.append(h)
+    del seen[:-200]
+    touch_channel(channel_id)
+    save_data()
+    return added
+
+def capture_reply_text(author, entries, session):
+    agg = aggregate_entries(entries)
+    added = sum(e["price"] for e in entries)
+    # Le nom lu entre crochets est affiche tel quel (il contient deja "Rune ..." pour les
+    # runes, et les autres objets ne sont plus faussement presentes comme des runes).
+    objets = "\n".join(
+        f"{name} x{v['qty']} {format_number(v['price'])} Kamas" for name, v in agg.items()
+    )
+    detail = "\n".join(f"+ {format_number(e['price'])}" for e in entries)
+    tail = f"{author.mention} -> +{format_number(added)}\nTotal global : {format_number(session['total'])}"
+    if payments_of(session):
+        tail += f"\nReste à payer : {format_number(amount_due(session))}"
+    text = f"{objets}\n\nCapture traitee :\n{detail}\n\n{tail}"
+    if len(text) > 1900:
+        text = f"{objets}\n\nCapture traitee : {len(entries)} lignes\n\n{tail}"
+    if len(text) > 1900:
+        text = f"Capture traitee : {len(entries)} lignes ({len(agg)} objets)\n\n{tail}"
+    return text
+
+def hold_message_text(entries, doubts, extra=""):
+    parts = ["⚠️ **Capture à vérifier : rien n'a été ajouté pour l'instant.**"]
+    if entries:
+        shown = [f"• {entry_label(e)}" for e in entries[:12]]
+        if len(entries) > 12:
+            shown.append(f"(+{len(entries) - 12} autre(s))")
+        parts.append(f"**Lignes lues ({len(entries)})** :\n" + "\n".join(shown))
+    shown_d = [f"• {d}" for d in doubts[:8]]
+    if len(doubts) > 8:
+        shown_d.append(f"(+{len(doubts) - 8} autre(s))")
+    parts.append("**À vérifier** :\n" + "\n".join(shown_d))
+    if extra:
+        parts.append(extra)
+    if entries:
+        parts.append("Les lignes « à vérifier » ne seront **pas** comptées si tu valides. "
+                     "Si l'une d'elles est réelle, ignore et renvoie une capture plus nette.")
+    else:
+        parts.append("Rien à valider. Si une ligne est réelle, renvoie une capture plus nette.")
+    return "\n\n".join(parts)[:1990]
+
+async def send_capture_event(message, author, added, entries):
+    await send_event(site_event(
+        "capture", message.id, message.channel, message.created_at,
+        author=site_author(author),
+        spentKamas=added,
+        lines=entries,
+    ))
+
+class CaptureConfirmView(discord.ui.View):
+    """Boutons affichés quand une capture est douteuse : rien n'est compté sans ton accord."""
+    def __init__(self, message, entries, hashes):
+        super().__init__(timeout=900)
+        self.message = message
+        self.entries = entries
+        self.hashes = hashes
+        self.done = False
+        self.reply_message = None
+
+    async def _allowed(self, interaction):
+        if interaction.user.id != self.message.author.id:
+            await interaction.response.send_message(
+                "Seul l'auteur de la capture peut la valider ou l'ignorer.", ephemeral=True)
+            return False
+        if self.done:
+            await interaction.response.send_message("Cette capture a déjà été traitée.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Valider les lignes lues", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        self.done = True
+        self.stop()
+        channel_id = str(self.message.channel.id)
+        session = sessions.get(channel_id)
+        if session is None or not session.get("active", True):
+            await interaction.response.edit_message(
+                content="La session n'est plus active : rien n'a été ajouté.", view=None)
+            return
+        added = commit_entries(session, channel_id, self.message.author, self.entries, self.hashes)
+        await interaction.response.edit_message(
+            content=capture_reply_text(self.message.author, self.entries, session), view=None)
+        await send_capture_event(self.message, self.message.author, added, self.entries)
+
+    @discord.ui.button(label="Ignorer cette capture", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(
+            content="Capture ignorée : rien n'a été ajouté.", view=None)
+
+    async def on_timeout(self):
+        if not self.done and self.reply_message is not None:
+            try:
+                await self.reply_message.edit(
+                    content="⌛ Capture expirée sans validation : rien n'a été ajouté.", view=None)
+            except discord.HTTPException:
+                pass
 
 # Ferme la session d'un salon en publiant le meme resume que /fmstop.
 async def close_session_in_channel(channel):
@@ -643,6 +860,8 @@ def channel_welcome_embed():
         description=(
             "**Commandes**\n"
             "`/fmtotal` · total en cours\n"
+            "`/fmpay` · enregistrer un paiement du client (ex : `20M`)\n"
+            "`/fmunpay` · annuler le dernier paiement\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -746,6 +965,60 @@ async def fmtotal(interaction: discord.Interaction):
     await interaction.response.send_message(message_out)
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
+
+@bot.tree.command(name="fmpay", description="Enregistrer un paiement du client sans arrêter la session")
+@app_commands.describe(montant="Montant payé : 20000000, 20 000 000, 20M, 20kk, 1.5M, 500k...")
+async def fmpay(interaction: discord.Interaction, montant: str):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+
+    amount = parse_kamas_amount(montant)
+    if amount is None:
+        return await interaction.response.send_message(
+            f"Montant non compris : « {montant} ». Exemples : `20000000`, `20 000 000`, `20M`, "
+            "`20kk`, `1.5M`, `500k`. Rien n'a été enregistré.", ephemeral=True)
+
+    session.setdefault("payments", []).append({
+        "amount": amount,
+        "by": str(interaction.user.id),
+        "at": now_iso(),
+    })
+    touch_channel(channel_id)
+    save_data()
+
+    due = amount_due(session)
+    text = (
+        f"Paiement enregistré : -{format_number(amount)} kamas\n"
+        f"Total dépensé : {format_number(session['total'])} kamas\n"
+        f"Paiements reçus : -{format_number(paid_total(session))} kamas "
+        f"({len(session['payments'])})\n"
+    )
+    if due >= 0:
+        text += f"**Reste à payer : {format_number(due)} kamas**"
+    else:
+        text += (f"**Trop-perçu : {format_number(-due)} kamas**\n"
+                 "⚠️ Ce paiement dépasse le reste dû. Si c'est une erreur : `/fmunpay`.")
+    await interaction.response.send_message(text)
+
+@bot.tree.command(name="fmunpay", description="Annuler le dernier paiement enregistré avec /fmpay")
+async def fmunpay(interaction: discord.Interaction):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    payments = session.get("payments") or []
+    if not payments:
+        return await interaction.response.send_message("Aucun paiement à annuler.", ephemeral=True)
+
+    cancelled = payments.pop()
+    touch_channel(channel_id)
+    save_data()
+    await interaction.response.send_message(
+        f"Paiement annulé : {format_number(cancelled['amount'])} kamas\n"
+        f"**Reste à payer : {format_number(amount_due(session))} kamas**"
+    )
 
 @bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")
 async def fmarchive(interaction: discord.Interaction):
@@ -904,87 +1177,47 @@ async def on_message(message):
     if not session["active"]:
         return
 
-    if "runes" not in session:
-        session["runes"] = {}
+    session.setdefault("runes", {})
 
-    if message.attachments:
-        added_total = 0
-        details = []
-        rune_totals = defaultdict(lambda: {"qty": 0, "price": 0})
-        # Chaque ligne lue, avant regroupement : c'est ce que le site recoit.
-        all_lines = []
-        all_orphans = []
+    images = [a for a in message.attachments if a.filename.lower().endswith(("png", "jpg", "jpeg"))]
+    if images:
+        entries, doubts, hashes = [], [], []
+        for attachment in images:
+            try:
+                # Lecture dans un thread : l'OCR bloque, il ne doit pas figer le bot.
+                analysis = await asyncio.to_thread(analyze_capture_url, attachment.url)
+            except Exception as exc:
+                print(f"[OCR] lecture impossible de {attachment.filename} : {exc}")
+                doubts.append(f"{attachment.filename} : image illisible")
+                continue
+            h = analysis["hash"]
+            if h in hashes:
+                doubts.append("la même image était jointe deux fois : la copie est ignorée")
+                continue
+            if h in session.get("seen", []):
+                doubts.append("image déjà comptée dans cette session : ignorée")
+                continue
+            hashes.append(h)
+            entries.extend(analysis["entries"])
+            doubts.extend(analysis["doubts"])
 
-        for attachment in message.attachments:
-            if attachment.filename.lower().endswith(("png", "jpg", "jpeg")):
-                values, runes, orphans = await process_image(attachment.url)
-
-                for v in values:
-                    added_total += v
-                    details.append(v)
-
-                for r in runes:
-                    rune_totals[r["name"]]["qty"] += r["qty"]
-                    rune_totals[r["name"]]["price"] += r["price"]
-                    all_lines.append(r)
-
-                all_orphans.extend(orphans)
-
-        if added_total > 0:
-            session["total"] += added_total
-            user_id = str(message.author.id)
-            if user_id not in session["users"]:
-                session["users"][user_id] = 0
-            session["users"][user_id] += added_total
-
-        for name, vals in rune_totals.items():
-            if name not in session["runes"]:
-                session["runes"][name] = {"qty": 0, "price": 0}
-            session["runes"][name]["qty"] += vals["qty"]
-            session["runes"][name]["price"] += vals["price"]
-
-        if added_total > 0 or rune_totals:
-            touch_channel(channel_id)
-            save_data()
-
-        reply_parts = []
-
-        if rune_totals:
-            rune_lines = "\n".join(
-                f"Rune {name} x{vals['qty']} {format_number(vals['price'])} Kamas"
-                for name, vals in rune_totals.items()
-            )
-            reply_parts.append(rune_lines)
-
-        if details:
-            detail_text = "\n".join([f"+ {format_number(v)}" for v in details])
-            reply_parts.append(
-                f"Capture traitee :\n{detail_text}\n\n"
-                f"{message.author.mention} -> +{format_number(added_total)}\n"
-                f"Total global : {format_number(session['total'])}"
-            )
-
-        if all_orphans:
-            # Debug : des lignes contenaient "kamas" mais n'ont pas pu
-            # etre rattachees a une rune. Affiche les premieres pour
-            # pouvoir ajuster le format si besoin, sans avoir a deviner.
-            shown = all_orphans[:10]
-            orphan_text = "\n".join(f"• {o}" for o in shown)
-            extra = ""
-            if len(all_orphans) > len(shown):
-                extra = f"\n(+{len(all_orphans) - len(shown)} autre(s) non affichee(s))"
-            reply_parts.append(
-                f"⚠️ Lignes non reconnues comme rune :\n{orphan_text}{extra}"
-            )
-
-        if reply_parts:
-            await message.reply("\n\n".join(reply_parts))
-            await send_event(site_event(
-                "capture", message.id, message.channel, message.created_at,
-                author=site_author(message.author),
-                spentKamas=added_total,
-                lines=all_lines,
-            ))
+        if not entries and not doubts:
+            await message.reply("Aucune ligne d'achat reconnue sur cette image : rien n'a été ajouté.")
+        elif doubts:
+            # Au moindre doute, RIEN n'est compté sans validation explicite.
+            text = hold_message_text(entries, doubts)
+            if entries:
+                view = CaptureConfirmView(message, entries, hashes)
+                view.reply_message = await message.reply(text, view=view)
+            else:
+                await message.reply(text)
+        else:
+            added = commit_entries(session, channel_id, message.author, entries, hashes)
+            try:
+                await message.reply(capture_reply_text(message.author, entries, session))
+            except discord.HTTPException as exc:
+                print(f"[BOT] reponse impossible apres enregistrement d'une capture : {exc}")
+            await send_capture_event(message, message.author, added, entries)
 
     await bot.process_commands(message)
 

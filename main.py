@@ -7,6 +7,7 @@ import requests
 from io import BytesIO
 import asyncio
 import datetime
+import math
 import re
 import json
 import os
@@ -96,6 +97,16 @@ FM_OUTCOMES = [
 ]
 ATTEMPT_BUTTON_PREFIX = "fm:attempt:"
 ATTEMPT_HISTORY_CAP = 200  # profondeur maximale du bouton « Annuler » (les compteurs, eux, sont illimites)
+# Le panneau redescend sous chaque nouvelle capture : il est toujours a portee de clic, sans remonter
+# le fil. Mettre FM_PANEL_FOLLOWS=0 pour le garder en un seul exemplaire, epingle (demande alors a
+# donner au bot les droits « Gerer les messages » / « Epingler des messages »).
+FM_PANEL_FOLLOWS = os.environ.get("FM_PANEL_FOLLOWS", "1") != "0"
+# Journal durable des tentatives (base de /fmstats), range dans data.json : au-dela, les plus
+# anciennes entrees sont oubliees. Les ecarts de plus de ATTEMPT_PAUSE_SECONDS entre deux
+# tentatives sont des pauses : ils ne comptent pas dans le rythme.
+ATTEMPT_LOG_CAP = 20000
+ATTEMPT_PAUSE_SECONDS = 600
+STATS_MIN_SAMPLE = 30
 
 # ---------------- DATA ---------------- #
 def save_data():
@@ -522,6 +533,138 @@ class CaptureConfirmView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+# ---------------- STATISTIQUES DES TENTATIVES ---------------- #
+# Chaque clic du panneau est aussi range dans un journal durable, independant des sessions (il
+# survit a /fmstop et /fmreset). Une entree = {"t": date ISO, "k": issue, "c": salon, "u": utilisateur}.
+def attempt_log():
+    return fm_state().setdefault("attempt_log", [])
+
+def log_attempt(channel_id, key, user_id, at):
+    log = attempt_log()
+    log.append({"t": at, "k": key, "c": str(channel_id), "u": str(user_id)})
+    del log[:-ATTEMPT_LOG_CAP]
+
+def unlog_attempt(channel_id, key, at):
+    """Retire du journal l'entree d'un clic annule (la plus recente qui correspond)."""
+    log = attempt_log()
+    for i in range(len(log) - 1, -1, -1):
+        e = log[i]
+        if e.get("t") == at and e.get("c") == str(channel_id) and e.get("k") == key:
+            del log[i]
+            return True
+    return False
+
+def wilson_interval(successes, n, z=1.96):
+    """Fourchette a 95 % du vrai taux, d'apres ce qui a ete observe (methode de Wilson)."""
+    if n <= 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {sec:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+def compute_attempt_stats(entries, pause_seconds=ATTEMPT_PAUSE_SECONDS):
+    """
+    Statistiques d'une liste d'entrees du journal. L'issue « visee » est la premiere de FM_OUTCOMES
+    (le succes critique). Le rythme est calcule sur les ecarts <= pause_seconds : les pauses (AFK,
+    nuit...) ne faussent donc pas le temps moyen.
+    """
+    known = [key for key, *_ in FM_OUTCOMES]
+    rows = []
+    for e in entries:
+        try:
+            when = datetime.datetime.fromisoformat(e["t"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if e.get("k") in known:
+            rows.append((when, e["k"]))
+    rows.sort(key=lambda r: r[0])
+
+    n = len(rows)
+    counts = {key: 0 for key in known}
+    for _, key in rows:
+        counts[key] += 1
+    gaps = [(rows[i][0] - rows[i - 1][0]).total_seconds() for i in range(1, n)]
+    active = [g for g in gaps if g <= pause_seconds]
+    target = known[0]
+
+    longest = current = 0
+    for _, key in rows:
+        if key == target:
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+
+    avg_gap = sum(active) / len(active) if active else None
+    per_target = n / counts[target] if counts[target] else None
+    return {
+        "n": n, "counts": counts, "target": target,
+        "first": rows[0][0] if rows else None, "last": rows[-1][0] if rows else None,
+        "avg_gap": avg_gap, "pauses": len(gaps) - len(active),
+        "per_target": per_target,
+        "time_per_target": avg_gap * per_target if (avg_gap is not None and per_target) else None,
+        "longest_without_target": longest, "current_without_target": current,
+    }
+
+def _decimal_fr(x):
+    return f"{x:.1f}".replace(".", ",")
+
+def stats_embed(stats, scope_label):
+    n = stats["n"]
+    description = f"**{n}** tentative(s) enregistrée(s)"
+    if stats["first"]:
+        description += (f" du <t:{int(stats['first'].timestamp())}:d>"
+                        f" au <t:{int(stats['last'].timestamp())}:d>")
+    if n < STATS_MIN_SAMPLE:
+        description += (f"\n⚠️ Moins de {STATS_MIN_SAMPLE} tentatives : les pourcentages sont très "
+                        "approximatifs, fie-toi aux fourchettes.")
+    embed = discord.Embed(title=f"📊 Statistiques de FM : {scope_label}", description=description,
+                          color=discord.Color.blurple())
+    for key, label, emoji, _style in FM_OUTCOMES:
+        c = stats["counts"][key]
+        low, high = wilson_interval(c, n)
+        embed.add_field(
+            name=f"{emoji} {label}",
+            value=f"**{c * 100 / n:.0f} %** ({c}/{n})\nfourchette : {low * 100:.0f} à {high * 100:.0f} %",
+            inline=True)
+
+    if stats["avg_gap"] is not None:
+        rhythm = f"1 tentative toutes les **{format_duration(stats['avg_gap'])}**"
+        if stats["pauses"]:
+            rhythm += f"\n{stats['pauses']} pause(s) de plus de {ATTEMPT_PAUSE_SECONDS // 60} min ignorée(s)"
+    else:
+        rhythm = "Pas assez de tentatives pour estimer le rythme."
+    embed.add_field(name="⏱️ Rythme", value=rhythm, inline=False)
+
+    _key, label, emoji, _style = FM_OUTCOMES[0]
+    if stats["per_target"]:
+        freq = f"1 toutes les **{_decimal_fr(stats['per_target'])}** tentatives"
+        if stats["time_per_target"] is not None:
+            freq += f"\n≈ 1 toutes les {format_duration(stats['time_per_target'])} d'activité"
+    else:
+        freq = "Aucun pour l'instant."
+    embed.add_field(name=f"{emoji} {label} : fréquence", value=freq, inline=False)
+    embed.add_field(
+        name="🔗 Séries",
+        value=(f"Plus longue série sans {label.lower()} : **{stats['longest_without_target']}**\n"
+               f"En cours : {stats['current_without_target']}"),
+        inline=False)
+    embed.set_footer(text="Fourchette = intervalle de confiance à 95 %. Chiffres observés sur tes "
+                          "tentatives, pas les probabilités réelles du jeu.")
+    return embed
+
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
 # Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
 # dans la session (data.json) ; l'identifiant du message du panneau est range a part, dans l'etat
@@ -579,19 +722,20 @@ async def _fetch_panel(channel):
 
 async def post_attempt_panel(channel, session):
     """
-    Poste un nouveau panneau, tente de l'epingler, puis supprime l'ancien s'il existait.
+    Poste un nouveau panneau, l'epingle (sauf en mode « suit le fil »), puis supprime l'ancien.
     Retourne (message, epingle). Un epinglage refuse n'empeche pas le panneau de fonctionner.
     """
     old = await _fetch_panel(channel)
     message = await channel.send(embed=attempts_embed(session), view=AttemptPanelView())
     panels()[str(channel.id)] = str(message.id)
     save_data()
-    pinned = True
-    try:
-        await message.pin()
-    except discord.HTTPException as exc:  # Forbidden en fait partie
-        pinned = False
-        print(f"[PANNEAU] epinglage impossible dans #{channel.name} : {exc}")
+    pinned = False
+    if not FM_PANEL_FOLLOWS:
+        try:
+            await message.pin()
+            pinned = True
+        except discord.HTTPException as exc:  # Forbidden en fait partie
+            print(f"[PANNEAU] epinglage impossible dans #{channel.name} : {exc}")
     if old is not None:
         try:
             await old.delete()
@@ -634,6 +778,30 @@ async def sync_attempt_panel(channel, session):
     except Exception as exc:
         print(f"[PANNEAU] mise a jour impossible dans #{getattr(channel, 'name', '?')} : {exc}")
 
+async def bump_attempt_panel(channel, session):
+    """
+    Fait redescendre le panneau sous le dernier message (appele apres chaque capture traitee).
+    Un seul panneau existe a la fois : le nouveau est poste, puis l'ancien supprime. Ne leve jamais.
+    """
+    if not FM_PANEL_FOLLOWS or str(channel.id) not in panels():
+        return
+    try:
+        old = await _fetch_panel(channel)
+        snapshot = attempts_total(session)
+        message = await channel.send(embed=attempts_embed(session), view=AttemptPanelView())
+        panels()[str(channel.id)] = str(message.id)
+        save_data()
+        if old is not None:
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+        if attempts_total(session) != snapshot:
+            # un clic est arrive pendant le deplacement : on rattrape l'affichage
+            await message.edit(embed=attempts_embed(session))
+    except Exception as exc:
+        print(f"[PANNEAU] deplacement impossible dans #{getattr(channel, 'name', '?')} : {exc}")
+
 class AttemptPanelView(discord.ui.View):
     """Boutons du panneau. Persistant (timeout=None) : il survit aux redemarrages du bot."""
     def __init__(self):
@@ -675,8 +843,10 @@ class AttemptPanelView(discord.ui.View):
             return
         attempts = attempts_of(session)
         attempts["counts"][key] = attempts["counts"].get(key, 0) + 1
-        attempts["history"].append({"k": key, "at": now_iso(), "by": str(interaction.user.id)})
+        at = now_iso()
+        attempts["history"].append({"k": key, "at": at, "by": str(interaction.user.id)})
         del attempts["history"][:-ATTEMPT_HISTORY_CAP]
+        log_attempt(interaction.channel.id, key, interaction.user.id, at)
         touch_channel(interaction.channel.id)
         save_data()
         await interaction.response.edit_message(embed=attempts_embed(session))
@@ -693,6 +863,7 @@ class AttemptPanelView(discord.ui.View):
         key = last.get("k")
         if attempts["counts"].get(key, 0) > 0:
             attempts["counts"][key] -= 1
+        unlog_attempt(interaction.channel.id, key, last.get("at"))
         touch_channel(interaction.channel.id)
         save_data()
         await interaction.response.edit_message(embed=attempts_embed(session))
@@ -865,14 +1036,17 @@ async def setup_guild(guild):
         print(f"[Salons FM] Message d'accueil impossible sur \"{guild.name}\" : {error}")
 
 def bot_channel_overwrite():
-    """Droits du bot dans un salon FM. Epingler le panneau demande « Gerer les messages » et, sur les
-    versions recentes de Discord et de discord.py, le droit distinct « Epingler des messages »."""
+    """Droits du bot dans un salon FM. Les droits d'epinglage (« Gerer les messages » et, sur les
+    versions recentes de Discord et de discord.py, « Epingler des messages ») ne sont demandes
+    que si le panneau est epingle (FM_PANEL_FOLLOWS=0)."""
     perms = dict(
         view_channel=True, send_messages=True, embed_links=True,
-        read_message_history=True, manage_channels=True, manage_messages=True,
+        read_message_history=True, manage_channels=True,
     )
-    if hasattr(discord.Permissions, "pin_messages"):
-        perms["pin_messages"] = True
+    if not FM_PANEL_FOLLOWS:
+        perms["manage_messages"] = True
+        if hasattr(discord.Permissions, "pin_messages"):
+            perms["pin_messages"] = True
     return discord.PermissionOverwrite(**perms)
 
 async def create_fm_channel(guild, member, raw_name, command_id=None):
@@ -1067,12 +1241,16 @@ def channel_welcome_embed():
             "`/fmpay` · enregistrer un paiement du client (ex : `20M`)\n"
             "`/fmunpay` · annuler le dernier paiement\n"
             "`/fmpanel` · reposter le panneau de suivi des tentatives\n"
+            "`/fmstats` · statistiques de tes tentatives (taux de réussite, rythme)\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
             "`/fmarchive` · archiver le salon, FM terminée\n\n"
             "Ta session est démarrée : poste ici tes **captures du chat** après tes achats à l'HDV.\n"
-            "Le panneau épinglé compte tes tentatives de FM : un clic à chaque rune passée."
+            + ("Le panneau de suivi redescend sous chaque capture et compte tes tentatives de FM : "
+               if FM_PANEL_FOLLOWS else
+               "Le panneau épinglé compte tes tentatives de FM : ")
+            + "un clic à chaque rune passée."
         ),
         color=WELCOME_COLOR,
     )
@@ -1229,7 +1407,7 @@ async def fmunpay(interaction: discord.Interaction):
         f"**Reste à payer : {format_number(amount_due(session))} kamas**"
     )
 
-@bot.tree.command(name="fmpanel", description="Poster (ou recréer) le panneau de suivi des tentatives, épinglé dans le salon")
+@bot.tree.command(name="fmpanel", description="Poster (ou recréer) le panneau de suivi des tentatives")
 async def fmpanel(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
     session = sessions.get(channel_id)
@@ -1245,12 +1423,37 @@ async def fmpanel(interaction: discord.Interaction):
         _message, pinned = await post_attempt_panel(interaction.channel, session)
     except discord.HTTPException as exc:
         return await interaction.followup.send(f"Impossible de poster le panneau : {exc}", ephemeral=True)
-    if pinned:
+    if FM_PANEL_FOLLOWS:
+        await interaction.followup.send(
+            "Panneau posté : il redescendra sous chaque nouvelle capture.", ephemeral=True)
+    elif pinned:
         await interaction.followup.send("Panneau posté et épinglé.", ephemeral=True)
     else:
         await interaction.followup.send(
             "Panneau posté, mais je n'ai pas pu l'épingler : il me manque le droit « Gérer les messages » "
             "(ou « Épingler des messages ») dans ce salon.", ephemeral=True)
+
+@bot.tree.command(name="fmstats", description="Statistiques de tes tentatives de FM : taux de réussite, rythme, séries")
+@app_commands.describe(portee="Ce salon (par défaut) ou tous tes salons")
+@app_commands.choices(portee=[
+    app_commands.Choice(name="Ce salon", value="salon"),
+    app_commands.Choice(name="Tous mes salons", value="tous"),
+])
+async def fmstats(interaction: discord.Interaction, portee: str = "salon"):
+    log = attempt_log()
+    if portee == "tous":
+        user_id = str(interaction.user.id)
+        entries = [e for e in log if e.get("u") == user_id]
+        label = "tous tes salons"
+    else:
+        channel_id = str(interaction.channel.id)
+        entries = [e for e in log if e.get("c") == channel_id]
+        label = f"#{getattr(interaction.channel, 'name', 'ce salon')}"
+    if not entries:
+        return await interaction.response.send_message(
+            "Aucune tentative enregistrée pour le moment. Elles sont comptées à chaque clic sur le "
+            "panneau de suivi.", ephemeral=True)
+    await interaction.response.send_message(embed=stats_embed(compute_attempt_stats(entries), label))
 
 @bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")
 async def fmarchive(interaction: discord.Interaction):
@@ -1453,6 +1656,7 @@ async def on_message(message):
             except discord.HTTPException as exc:
                 print(f"[BOT] reponse impossible apres enregistrement d'une capture : {exc}")
             await send_capture_event(message, message.author, added, entries)
+        await bump_attempt_panel(message.channel, session)
 
     await bot.process_commands(message)
 

@@ -85,6 +85,18 @@ FM_WELCOME_CHANNEL_NAME = "forgemagie"
 MAX_CHANNEL_NAME = 30
 NEW_SESSION_BUTTON_ID = "fm:new-session"
 
+# Issues possibles d'une tentative de FM, dans l'ordre des boutons du panneau :
+# (cle interne, libelle, emoji, couleur du bouton). Pour ajouter, retirer ou renommer une issue,
+# il suffit de modifier cette liste (4 issues au maximum : avec « Annuler », une rangee de
+# boutons Discord n'en contient que 5). Apres un changement, reposte les panneaux avec /fmpanel.
+FM_OUTCOMES = [
+    ("sc", "Succès critique", "✅", discord.ButtonStyle.success),
+    ("sn", "Succès neutre", "🟡", discord.ButtonStyle.secondary),
+    ("ec", "Échec", "❌", discord.ButtonStyle.danger),
+]
+ATTEMPT_BUTTON_PREFIX = "fm:attempt:"
+ATTEMPT_HISTORY_CAP = 200  # profondeur maximale du bouton « Annuler » (les compteurs, eux, sont illimites)
+
 # ---------------- DATA ---------------- #
 def save_data():
     with open("data.json", "w") as f:
@@ -246,6 +258,7 @@ def empty_session():
         "runes": {},
         "payments": [],
         "seen": [],
+        "attempts": new_attempts(),
         "active": True
     }
 
@@ -357,6 +370,9 @@ def session_summary(session, title):
     else:
         resume = "Aucune donnee."
     text = f"{title}\n\n{resume}\n\n"
+    attempts = attempts_line(session)
+    if attempts:
+        text += attempts + "\n\n"
     payments = payments_of(session)
     if not payments:
         return text + f"TOTAL : {format_number(session['total'])} kamas"
@@ -506,6 +522,181 @@ class CaptureConfirmView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+# ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
+# Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
+# dans la session (data.json) ; l'identifiant du message du panneau est range a part, dans l'etat
+# FM, pour survivre a /fmreset et /fmstart.
+def new_attempts():
+    return {"counts": {key: 0 for key, *_ in FM_OUTCOMES}, "history": []}
+
+def attempts_of(session):
+    # Les sessions creees avant cette fonctionnalite n'ont pas la cle : on la cree a la volee.
+    attempts = session.setdefault("attempts", new_attempts())
+    counts = attempts.setdefault("counts", {})
+    for key, *_ in FM_OUTCOMES:
+        counts.setdefault(key, 0)
+    attempts.setdefault("history", [])
+    return attempts
+
+def attempts_total(session):
+    counts = attempts_of(session)["counts"]
+    return sum(counts.get(key, 0) for key, *_ in FM_OUTCOMES)
+
+def attempts_line(session):
+    total = attempts_total(session)
+    if total == 0:
+        return ""
+    counts = attempts_of(session)["counts"]
+    detail = " · ".join(f"{emoji} {counts.get(key, 0)}" for key, _label, emoji, _style in FM_OUTCOMES)
+    return f"Tentatives : {total} ({detail})"
+
+def attempts_embed(session, closed=False):
+    counts = attempts_of(session)["counts"]
+    total = attempts_total(session)
+    embed = discord.Embed(
+        title="🔨 Suivi des tentatives de FM",
+        description="Session terminée." if closed else "Clique après chaque rune passée.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Tentatives", value=f"**{total}**", inline=False)
+    for key, label, emoji, _style in FM_OUTCOMES:
+        n = counts.get(key, 0)
+        share = f" ({n * 100 / total:.0f} %)" if total else ""
+        embed.add_field(name=f"{emoji} {label}", value=f"**{n}**{share}", inline=True)
+    return embed
+
+def panels():
+    return fm_state().setdefault("panels", {})
+
+async def _fetch_panel(channel):
+    panel_id = panels().get(str(channel.id))
+    if not panel_id:
+        return None
+    try:
+        return await channel.fetch_message(int(panel_id))
+    except (discord.HTTPException, ValueError):  # message supprime, droits retires...
+        return None
+
+async def post_attempt_panel(channel, session):
+    """
+    Poste un nouveau panneau, tente de l'epingler, puis supprime l'ancien s'il existait.
+    Retourne (message, epingle). Un epinglage refuse n'empeche pas le panneau de fonctionner.
+    """
+    old = await _fetch_panel(channel)
+    message = await channel.send(embed=attempts_embed(session), view=AttemptPanelView())
+    panels()[str(channel.id)] = str(message.id)
+    save_data()
+    pinned = True
+    try:
+        await message.pin()
+    except discord.HTTPException as exc:  # Forbidden en fait partie
+        pinned = False
+        print(f"[PANNEAU] epinglage impossible dans #{channel.name} : {exc}")
+    if old is not None:
+        try:
+            await old.delete()
+        except discord.HTTPException:
+            pass
+    return message, pinned
+
+async def refresh_attempt_panel(channel, session):
+    message = await _fetch_panel(channel)
+    if message is None:
+        return False
+    try:
+        await message.edit(embed=attempts_embed(session))
+        return True
+    except discord.HTTPException:
+        return False
+
+async def finalize_attempt_panel(channel, session):
+    """Session terminee : le panneau reste (epingle, avec ses chiffres finaux) mais sans boutons."""
+    panel_id = panels().pop(str(channel.id), None)
+    if not panel_id:
+        return
+    save_data()
+    try:
+        message = await channel.fetch_message(int(panel_id))
+        await message.edit(embed=attempts_embed(session, closed=True), view=None)
+    except (discord.HTTPException, ValueError):
+        pass
+
+async def sync_attempt_panel(channel, session):
+    """
+    Session (re)demarree : remet le panneau existant a jour, ou en cree un dans un salon FM
+    personnel. Ne leve jamais : le panneau est un confort, il ne doit pas gener les commandes.
+    """
+    try:
+        if await refresh_attempt_panel(channel, session):
+            return
+        if str(channel.id) in fm_channels():
+            await post_attempt_panel(channel, session)
+    except Exception as exc:
+        print(f"[PANNEAU] mise a jour impossible dans #{getattr(channel, 'name', '?')} : {exc}")
+
+class AttemptPanelView(discord.ui.View):
+    """Boutons du panneau. Persistant (timeout=None) : il survit aux redemarrages du bot."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        for key, label, emoji, style in FM_OUTCOMES:
+            button = discord.ui.Button(
+                label=label, emoji=emoji, style=style, custom_id=ATTEMPT_BUTTON_PREFIX + key)
+            button.callback = self._outcome_callback(key)
+            self.add_item(button)
+        undo = discord.ui.Button(
+            label="Annuler", emoji="↩️", style=discord.ButtonStyle.secondary,
+            custom_id=ATTEMPT_BUTTON_PREFIX + "undo")
+        undo.callback = self._undo
+        self.add_item(undo)
+
+    def _outcome_callback(self, key):
+        async def callback(interaction):
+            await self._record(interaction, key)
+        return callback
+
+    async def _session_for(self, interaction):
+        """Session du salon, apres controle du proprietaire. Sinon repond a l'utilisateur et renvoie None."""
+        channel_id = str(interaction.channel.id)
+        session = sessions.get(channel_id)
+        if session is None:
+            await interaction.response.send_message(
+                "Aucune session active dans ce salon : ce panneau n'est plus utilisable.", ephemeral=True)
+            return None
+        entry = fm_channels().get(channel_id)
+        if entry and str(interaction.user.id) != str(entry.get("owner_id")):
+            await interaction.response.send_message(
+                "Seul le propriétaire du salon peut utiliser ce panneau.", ephemeral=True)
+            return None
+        return session
+
+    async def _record(self, interaction, key):
+        session = await self._session_for(interaction)
+        if session is None:
+            return
+        attempts = attempts_of(session)
+        attempts["counts"][key] = attempts["counts"].get(key, 0) + 1
+        attempts["history"].append({"k": key, "at": now_iso(), "by": str(interaction.user.id)})
+        del attempts["history"][:-ATTEMPT_HISTORY_CAP]
+        touch_channel(interaction.channel.id)
+        save_data()
+        await interaction.response.edit_message(embed=attempts_embed(session))
+
+    async def _undo(self, interaction):
+        session = await self._session_for(interaction)
+        if session is None:
+            return
+        attempts = attempts_of(session)
+        if not attempts["history"]:
+            await interaction.response.send_message("Rien à annuler.", ephemeral=True)
+            return
+        last = attempts["history"].pop()
+        key = last.get("k")
+        if attempts["counts"].get(key, 0) > 0:
+            attempts["counts"][key] -= 1
+        touch_channel(interaction.channel.id)
+        save_data()
+        await interaction.response.edit_message(embed=attempts_embed(session))
+
 # Ferme la session d'un salon en publiant le meme resume que /fmstop.
 async def close_session_in_channel(channel):
     channel_id = str(channel.id)
@@ -516,6 +707,7 @@ async def close_session_in_channel(channel):
     await channel.send(session_summary(session, "Resume final"))
     if session.get("runes"):
         await send_rune_embeds(channel.send, session["runes"])
+    await finalize_attempt_panel(channel, session)
     return True
 
 # ---------------- SITE DOFUS CRAFT ---------------- #
@@ -672,6 +864,17 @@ async def setup_guild(guild):
     except discord.HTTPException as error:
         print(f"[Salons FM] Message d'accueil impossible sur \"{guild.name}\" : {error}")
 
+def bot_channel_overwrite():
+    """Droits du bot dans un salon FM. Epingler le panneau demande « Gerer les messages » et, sur les
+    versions recentes de Discord et de discord.py, le droit distinct « Epingler des messages »."""
+    perms = dict(
+        view_channel=True, send_messages=True, embed_links=True,
+        read_message_history=True, manage_channels=True, manage_messages=True,
+    )
+    if hasattr(discord.Permissions, "pin_messages"):
+        perms["pin_messages"] = True
+    return discord.PermissionOverwrite(**perms)
+
 async def create_fm_channel(guild, member, raw_name, command_id=None):
     if not FM_PERSONAL_CHANNELS:
         raise ChannelError("Les salons FM personnels ne sont pas actives sur ce serveur.")
@@ -701,10 +904,7 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
             view_channel=True, send_messages=True, attach_files=True,
             read_message_history=True, use_application_commands=True,
         ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, embed_links=True,
-            read_message_history=True, manage_channels=True,
-        ),
+        guild.me: bot_channel_overwrite(),
     }
     channel = await guild.create_text_channel(
         channel_name, category=category, overwrites=overwrites,
@@ -721,6 +921,10 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
     save_data()
 
     await channel.send(embed=channel_welcome_embed())
+    try:
+        await post_attempt_panel(channel, sessions[str(channel.id)])
+    except Exception as exc:  # confort : ne doit jamais empecher la creation du salon
+        print(f"[PANNEAU] creation impossible dans #{channel.name} : {exc}")
     created = {"author": site_author(member)}
     if command_id:
         created["commandId"] = command_id
@@ -862,11 +1066,13 @@ def channel_welcome_embed():
             "`/fmtotal` · total en cours\n"
             "`/fmpay` · enregistrer un paiement du client (ex : `20M`)\n"
             "`/fmunpay` · annuler le dernier paiement\n"
+            "`/fmpanel` · reposter le panneau de suivi des tentatives\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
             "`/fmarchive` · archiver le salon, FM terminée\n\n"
-            "Ta session est démarrée : poste ici tes **captures du chat** après tes achats à l'HDV."
+            "Ta session est démarrée : poste ici tes **captures du chat** après tes achats à l'HDV.\n"
+            "Le panneau épinglé compte tes tentatives de FM : un clic à chaque rune passée."
         ),
         color=WELCOME_COLOR,
     )
@@ -923,6 +1129,7 @@ async def fmstart(interaction: discord.Interaction):
         "session-start", interaction.id, interaction.channel, interaction.created_at,
         author=site_author(interaction.user),
     ))
+    await sync_attempt_panel(interaction.channel, sessions[channel_id])
 
 @bot.tree.command(name="fmstop", description="Arreter la session et afficher le resume")
 async def fmstop(interaction: discord.Interaction):
@@ -942,6 +1149,7 @@ async def fmstop(interaction: discord.Interaction):
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
     await send_event(site_event("session-stop", interaction.id, interaction.channel, interaction.created_at))
+    await finalize_attempt_panel(interaction.channel, session)
 
 @bot.tree.command(name="fmreset", description="Reinitialiser la session")
 async def fmreset(interaction: discord.Interaction):
@@ -951,6 +1159,7 @@ async def fmreset(interaction: discord.Interaction):
     save_data()
     await interaction.response.send_message("Session reinitialisee !")
     await send_event(site_event("session-reset", interaction.id, interaction.channel, interaction.created_at))
+    await sync_attempt_panel(interaction.channel, sessions[channel_id])
 
 @bot.tree.command(name="fmtotal", description="Voir le total actuel")
 async def fmtotal(interaction: discord.Interaction):
@@ -1020,6 +1229,29 @@ async def fmunpay(interaction: discord.Interaction):
         f"**Reste à payer : {format_number(amount_due(session))} kamas**"
     )
 
+@bot.tree.command(name="fmpanel", description="Poster (ou recréer) le panneau de suivi des tentatives, épinglé dans le salon")
+async def fmpanel(interaction: discord.Interaction):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    entry = fm_channels().get(channel_id)
+    if entry and str(interaction.user.id) != str(entry.get("owner_id")):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon peut recréer ce panneau.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        _message, pinned = await post_attempt_panel(interaction.channel, session)
+    except discord.HTTPException as exc:
+        return await interaction.followup.send(f"Impossible de poster le panneau : {exc}", ephemeral=True)
+    if pinned:
+        await interaction.followup.send("Panneau posté et épinglé.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "Panneau posté, mais je n'ai pas pu l'épingler : il me manque le droit « Gérer les messages » "
+            "(ou « Épingler des messages ») dans ce salon.", ephemeral=True)
+
 @bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")
 async def fmarchive(interaction: discord.Interaction):
     entry = fm_channels().get(str(interaction.channel.id))
@@ -1081,6 +1313,7 @@ async def poll_site():
                         f"Session FM demarree depuis le site par {player.get('displayName', 'un joueur')}"
                         + (f" ({item['name']})" if item else "")
                     )
+                    await sync_attempt_panel(channel, sessions[str(channel.id)])
                 elif command["type"] == "close" and channel is not None:
                     await close_session_in_channel(channel)
                 # « Archiver la seance » sur le site : comme /fmarchive. Salon deja archive ou
@@ -1120,6 +1353,7 @@ async def archive_inactive_channels():
 @bot.event
 async def setup_hook():
     bot.add_view(NewSessionView())
+    bot.add_view(AttemptPanelView())
 
 @bot.event
 async def on_ready():
@@ -1161,6 +1395,7 @@ async def on_guild_channel_delete(channel):
     if entry:
         entry["status"] = "deleted"
         sessions.pop(str(channel.id), None)
+        panels().pop(str(channel.id), None)
         save_data()
         await send_event(site_event("channel-deleted", f"{channel.id}-deleted", channel))
 

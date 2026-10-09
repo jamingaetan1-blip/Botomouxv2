@@ -107,6 +107,9 @@ FM_PANEL_FOLLOWS = os.environ.get("FM_PANEL_FOLLOWS", "1") != "0"
 ATTEMPT_LOG_CAP = 20000
 ATTEMPT_PAUSE_SECONDS = 600
 STATS_MIN_SAMPLE = 30
+# Historique des sessions terminees (base de /fmhistorique), range dans data.json.
+SESSION_HISTORY_CAP = 500
+SESSION_HISTORY_ITEMS = 40   # objets gardes par session (les plus depenses)
 
 # ---------------- DATA ---------------- #
 def save_data():
@@ -270,6 +273,7 @@ def empty_session():
         "payments": [],
         "seen": [],
         "attempts": new_attempts(),
+        "started_at": now_iso(),
         "active": True
     }
 
@@ -331,37 +335,64 @@ _GROUPED_INT = re.compile(r"^\d{1,3}(?:[ .,]\d{3})+$")
 _DECIMAL = re.compile(r"^\d+(?:[.,]\d+)?$")
 _AMOUNT_SUFFIX = {"k": 1_000, "m": 1_000_000, "kk": 1_000_000}
 
+_SUFFIX_DECIMAL_RE = re.compile(r"^(\d+)\s*(kk|k|m)\s*(\d+)\s*(?:kamas?)?$", re.IGNORECASE)
+
 def parse_kamas_amount(raw):
     """
     Lit un montant ecrit par un humain. Retourne un entier > 0, ou None si ambigu.
-    Accepte : 20000000 | 20 000 000 | 20.000.000 | 20M | 20m | 20kk | 1.5M | 1,5M | 500k
+    Accepte : 20000000 | 20 000 000 | 20.000.000 | 20M | 20m | 20kk | 1.5M | 1,5M | 500k | 1M6 | 2M35
     Sans suffixe, "." et "," ne sont que des separateurs de milliers (20.5 est refuse
-    plutot que lu "205"). Avec suffixe, ils sont la virgule decimale.
+    plutot que lu "205"). Avec suffixe, ils sont la virgule decimale. « 1M6 » se lit 1,6 million
+    (les chiffres apres la lettre sont les decimales : 1M6 = 1 600 000, 2M05 = 2 050 000).
     """
     text = (raw or "").replace("\u00a0", " ").replace("\u202f", " ").strip().lower()
-    m = _AMOUNT_RE.match(text)
-    if not m:
-        return None
-    number, suffix = m.group(1).strip(), (m.group(2) or "")
-    if not number:
-        return None
     try:
-        if suffix:
-            compact = number.replace(" ", "")
-            if not _DECIMAL.match(compact):
-                return None
-            value = Decimal(compact.replace(",", ".")) * _AMOUNT_SUFFIX[suffix]
-        elif _PLAIN_INT.match(number):
-            value = Decimal(number)
-        elif _GROUPED_INT.match(number):
-            value = Decimal(re.sub(r"[ .,]", "", number))
+        m_dec = _SUFFIX_DECIMAL_RE.match(text)
+        if m_dec:
+            value = Decimal(f"{m_dec.group(1)}.{m_dec.group(3)}") * _AMOUNT_SUFFIX[m_dec.group(2)]
         else:
-            return None
+            m = _AMOUNT_RE.match(text)
+            if not m:
+                return None
+            number, suffix = m.group(1).strip(), (m.group(2) or "")
+            if not number:
+                return None
+            if suffix:
+                compact = number.replace(" ", "")
+                if not _DECIMAL.match(compact):
+                    return None
+                value = Decimal(compact.replace(",", ".")) * _AMOUNT_SUFFIX[suffix]
+            elif _PLAIN_INT.match(number):
+                value = Decimal(number)
+            elif _GROUPED_INT.match(number):
+                value = Decimal(re.sub(r"[ .,]", "", number))
+            else:
+                return None
     except InvalidOperation:
         return None
     if value <= 0 or value != value.to_integral_value():
         return None
     return int(value)
+
+def parse_signed_kamas_amount(raw):
+    """
+    Comme parse_kamas_amount, avec un signe optionnel pour /fmpay :
+    20M ou +20M = paiement du client ; -1M6 = montant AJOUTE au total (stock apporte...).
+    Retourne un entier non nul (signe conserve) ou None.
+    """
+    text = (raw or "").strip()
+    sign = 1
+    if text and text[0] in "-\u2212\u2013":  # tiret, vrai signe moins, tiret demi-cadratin (clavier mobile)
+        sign, text = -1, text[1:]
+    elif text[:1] == "+":
+        text = text[1:]
+    value = parse_kamas_amount(text)
+    return None if value is None else sign * value
+
+def payment_totals(session):
+    """(paiements recus, ajustements ajoutes au total) : deux montants positifs."""
+    amounts = [p["amount"] for p in payments_of(session)]
+    return sum(a for a in amounts if a > 0), -sum(a for a in amounts if a < 0)
 
 def _payment_when(payment):
     try:
@@ -388,14 +419,20 @@ def session_summary(session, title):
     if not payments:
         return text + f"TOTAL : {format_number(session['total'])} kamas"
 
-    lines = [
-        f"TOTAL DÉPENSÉ : {format_number(session['total'])} kamas",
-        f"Paiements reçus ({len(payments)}) : -{format_number(paid_total(session))} kamas",
-    ]
+    received, charged = payment_totals(session)
+    lines = [f"TOTAL DÉPENSÉ : {format_number(session['total'])} kamas"]
+    if charged:
+        n_adjust = sum(1 for p in payments if p["amount"] < 0)
+        lines.append(f"Ajustements ({n_adjust}) : +{format_number(charged)} kamas")
+    if received:
+        n_paid = sum(1 for p in payments if p["amount"] > 0)
+        lines.append(f"Paiements reçus ({n_paid}) : -{format_number(received)} kamas")
     for p in payments[-10:]:
-        lines.append(f"  • -{format_number(p['amount'])} kamas ({_payment_when(p)})")
+        sign = "-" if p["amount"] > 0 else "+"   # effet sur le reste a payer
+        note = f" · {p['note']}" if p.get("note") else ""
+        lines.append(f"  • {sign}{format_number(abs(p['amount']))} kamas{note} ({_payment_when(p)})")
     if len(payments) > 10:
-        lines.append(f"  (+{len(payments) - 10} paiement(s) plus ancien(s))")
+        lines.append(f"  (+{len(payments) - 10} ligne(s) plus ancienne(s))")
     due = amount_due(session)
     if due >= 0:
         lines.append(f"RESTE À PAYER : {format_number(due)} kamas")
@@ -612,7 +649,7 @@ def compute_attempt_stats(entries, pause_seconds=ATTEMPT_PAUSE_SECONDS):
     return {
         "n": n, "counts": counts, "target": target,
         "first": rows[0][0] if rows else None, "last": rows[-1][0] if rows else None,
-        "avg_gap": avg_gap, "pauses": len(gaps) - len(active),
+        "avg_gap": avg_gap, "pauses": len(gaps) - len(active), "active_seconds": sum(active),
         "per_target": per_target,
         "time_per_target": avg_gap * per_target if (avg_gap is not None and per_target) else None,
         "longest_without_target": longest, "current_without_target": current,
@@ -663,6 +700,191 @@ def stats_embed(stats, scope_label):
         inline=False)
     embed.set_footer(text="Fourchette = intervalle de confiance à 95 %. Chiffres observés sur tes "
                           "tentatives, pas les probabilités réelles du jeu.")
+    return embed
+
+# ---------------- HISTORIQUE D'UN JOUEUR ---------------- #
+# Une session qui se ferme ne laisse rien derriere elle (le salon ne garde que son proprietaire) :
+# on en garde ici un resume durable. Une entree = une session terminee, attribuee au proprietaire du
+# salon. Les sessions fermees AVANT cette fonction n'ont pas de detail : elles ne peuvent pas etre retrouvees.
+def session_has_activity(session):
+    return bool(session["total"] or attempts_total(session) or payments_of(session))
+
+def build_session_record(channel_id, name, owner, session, end, why):
+    entry = fm_channels().get(str(channel_id)) or {}
+    received, charged = payment_totals(session)
+    items = sorted((session.get("runes") or {}).items(), key=lambda kv: -kv[1].get("price", 0))
+    return {
+        "ch": str(channel_id), "name": name or "", "owner": owner,
+        "start": session.get("started_at") or entry.get("created_at"), "end": end,
+        "total": session["total"], "adjust": charged, "paid": received,
+        "items": {n: [v.get("qty", 0), v.get("price", 0)] for n, v in items[:SESSION_HISTORY_ITEMS]},
+        "attempts": dict(attempts_of(session)["counts"]), "why": why,
+    }
+
+def record_session_history(channel, session, why):
+    """Appele quand une session se ferme. Les sessions vides (rien achete, aucun clic) ne sont pas gardees."""
+    if not session_has_activity(session):
+        return
+    entry = fm_channels().get(str(channel.id)) or {}
+    history = fm_state().setdefault("history", [])
+    history.append(build_session_record(
+        channel.id, getattr(channel, "name", ""), entry.get("owner_id"), session, now_iso(), why))
+    del history[:-SESSION_HISTORY_CAP]
+
+def live_records_of(player_id, name_of):
+    """Sessions EN COURS d'un joueur, au meme format que les sessions terminees."""
+    records = []
+    for channel_id, entry in fm_channels().items():
+        if entry.get("owner_id") != str(player_id):
+            continue
+        session = sessions.get(channel_id)
+        if session is None or not session_has_activity(session):
+            continue
+        record = build_session_record(channel_id, name_of(channel_id), str(player_id), session, None, "live")
+        record["live"] = True
+        records.append(record)
+    return records
+
+def longest_streaks(entries):
+    """
+    Records de series, calcules SALON PAR SALON (une serie ne traverse pas deux objets differents).
+    Retourne {"fail": (longueur, salon, date de fin), "target": ..., "no_target": ...}.
+    fail = enchainement d'echecs (derniere issue de FM_OUTCOMES), target = enchainement de succes
+    critiques (premiere issue), no_target = tentatives d'affilee sans succes critique.
+    """
+    known = [key for key, *_ in FM_OUTCOMES]
+    target_key, fail_key = known[0], known[-1]
+    by_channel = {}
+    for e in entries:
+        try:
+            when = datetime.datetime.fromisoformat(e["t"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if e.get("k") in known:
+            by_channel.setdefault(e.get("c"), []).append((when, e["k"]))
+    best = {"fail": (0, None, None), "target": (0, None, None), "no_target": (0, None, None)}
+    for channel, rows in by_channel.items():
+        rows.sort(key=lambda r: r[0])
+        runs = {"fail": 0, "target": 0, "no_target": 0}
+        for when, key in rows:
+            runs["fail"] = runs["fail"] + 1 if key == fail_key else 0
+            runs["target"] = runs["target"] + 1 if key == target_key else 0
+            runs["no_target"] = runs["no_target"] + 1 if key != target_key else 0
+            for name, length in runs.items():
+                if length > best[name][0]:
+                    best[name] = (length, channel, when)
+    return best
+
+def record_amount(record):
+    """Montant d'une commande = achats + ajustements (stock apporte), avant deduction des paiements."""
+    return record["total"] + record.get("adjust", 0)
+
+def compute_player_profile(records, log_entries):
+    amounts = [record_amount(r) for r in records]
+    items = {}
+    for r in records:
+        for name, (qty, price) in r.get("items", {}).items():
+            cur = items.setdefault(name, [0, 0])
+            cur[0] += qty
+            cur[1] += price
+    top_items = sorted(items.items(), key=lambda kv: -kv[1][1])[:3]
+    stamps = []
+    for r in records:
+        for key in ("start", "end"):
+            try:
+                stamps.append(datetime.datetime.fromisoformat(r[key]))
+            except (KeyError, ValueError, TypeError):
+                pass
+    return {
+        "n": len(records),
+        "biggest": max(records, key=record_amount) if records else None,
+        "biggest_amount": max(amounts) if amounts else 0,
+        "average": sum(amounts) / len(amounts) if amounts else 0,
+        "sum_total": sum(r["total"] for r in records),
+        "top_items": [(name, qty, price) for name, (qty, price) in top_items],
+        "attempts": compute_attempt_stats(log_entries),
+        "streaks": longest_streaks(log_entries),
+        "first": min(stamps) if stamps else None, "last": max(stamps) if stamps else None,
+    }
+
+def _cut(text, limit=1000):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+def _record_date(record):
+    for key in ("end", "start"):
+        try:
+            return f"<t:{int(datetime.datetime.fromisoformat(record[key]).timestamp())}:d>"
+        except (KeyError, ValueError, TypeError):
+            continue
+    return "date inconnue"
+
+def history_embed(display_name, profile, records, owned_total, without_details):
+    n = profile["n"]
+    live_n = sum(1 for r in records if r.get("live"))
+    description = f"**{owned_total}** salon(s) FM · **{n}** session(s) avec données"
+    if live_n:
+        description += f" (dont {live_n} en cours)"
+    if without_details:
+        description += (f"\n{without_details} salon(s) plus ancien(s) sans détails : "
+                        "fermés avant la mise en place de l'historique.")
+    embed = discord.Embed(title=f"🗂️ Historique de {display_name}", description=description,
+                          color=discord.Color.blurple())
+    names = {r["ch"]: r.get("name") or "salon" for r in records}
+
+    if n:
+        big = profile["biggest"]
+        stock = f", dont {format_number(big['adjust'])} de stock" if big.get("adjust") else ""
+        embed.add_field(name="💰 Commandes", value=_cut(
+            f"Plus grosse : **{format_number(profile['biggest_amount'])}** kamas{stock}\n"
+            f"↳ #{big.get('name') or 'salon'} · {_record_date(big)}\n"
+            f"Moyenne : {format_number(round(profile['average']))} kamas\n"
+            f"Total dépensé : {format_number(profile['sum_total'])} kamas"), inline=False)
+
+    a = profile["attempts"]
+    if a["n"]:
+        _k, t_label, t_emoji, _s = FM_OUTCOMES[0]
+        c = a["counts"][FM_OUTCOMES[0][0]]
+        low, high = wilson_interval(c, a["n"])
+        lines = [f"**{a['n']}** tentatives · {t_emoji} {c} ({c * 100 / a['n']:.0f} %, "
+                 f"fourchette {low * 100:.0f} à {high * 100:.0f} %)"]
+        if a["per_target"]:
+            lines.append(f"1 {t_label.lower()} toutes les {_decimal_fr(a['per_target'])} tentatives")
+        if a["active_seconds"]:
+            lines.append(f"Temps de forge actif : {format_duration(a['active_seconds'])}")
+        embed.add_field(name="🔨 Tentatives", value=_cut("\n".join(lines)), inline=False)
+
+        st = profile["streaks"]
+        fail_label, target_label = FM_OUTCOMES[-1][1].lower(), FM_OUTCOMES[0][1].lower()
+        rows = []
+        for key, text in (("fail", f"Plus longue série d'{fail_label}s"),
+                          ("target", f"Meilleure série de {target_label}s d'affilée"),
+                          ("no_target", f"Plus longue série sans {target_label}")):
+            length, channel, when = st[key]
+            if length:
+                rows.append(f"{text} : **{length}** · #{names.get(channel, 'salon')} "
+                            f"· <t:{int(when.timestamp())}:d>")
+        if rows:
+            embed.add_field(name="🏅 Records", value=_cut("\n".join(rows)), inline=False)
+
+    if profile["top_items"]:
+        embed.add_field(name="🏆 Objets les plus dépensés", value=_cut("\n".join(
+            f"{name} : {format_number(qty)} u. · {format_number(price)} kamas"
+            for name, qty, price in profile["top_items"])), inline=False)
+
+    if records:
+        ordered = sorted(records, key=lambda r: (not r.get("live"), -(
+            datetime.datetime.fromisoformat(r["end"]).timestamp() if r.get("end") else 0)))
+        lines = []
+        for r in ordered[:8]:
+            tries = sum((r.get("attempts") or {}).values())
+            state = "en cours" if r.get("live") else "terminée"
+            lines.append(f"• {_record_date(r)} · #{r.get('name') or 'salon'} · "
+                         f"**{format_number(record_amount(r))}** kamas · {tries} tent. · {state}")
+        more = f"\n(+{len(ordered) - 8} plus ancienne(s))" if len(ordered) > 8 else ""
+        embed.add_field(name="🕘 Dernières sessions", value=_cut("\n".join(lines) + more), inline=False)
+
+    embed.set_footer(text="Historique détaillé depuis la mise en place de cette fonction. Montant d'une "
+                          "commande = achats + stock apporté, avant paiements.")
     return embed
 
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
@@ -872,6 +1094,8 @@ class AttemptPanelView(discord.ui.View):
 async def close_session_in_channel(channel):
     channel_id = str(channel.id)
     session = sessions.pop(channel_id, None)
+    if session is not None:
+        record_session_history(channel, session, "close")
     save_data()
     if session is None:
         return False
@@ -1238,10 +1462,11 @@ def channel_welcome_embed():
         description=(
             "**Commandes**\n"
             "`/fmtotal` · total en cours\n"
-            "`/fmpay` · enregistrer un paiement du client (ex : `20M`)\n"
+            "`/fmpay` · paiement du client (ex : `20M`), ou `-1M6` pour ajouter un stock apporté au total\n"
             "`/fmunpay` · annuler le dernier paiement\n"
             "`/fmpanel` · reposter le panneau de suivi des tentatives\n"
             "`/fmstats` · statistiques de tes tentatives (taux de réussite, rythme)\n"
+            "`/fmhistorique` · ton historique et tes records (ou ceux d'un autre joueur)\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -1319,6 +1544,7 @@ async def fmstop(interaction: discord.Interaction):
     runes = session.get("runes", {})
     message_out = session_summary(session, "Resume final")
 
+    record_session_history(interaction.channel, session, "stop")
     del sessions[channel_id]
     touch_channel(channel_id)
     save_data()
@@ -1353,43 +1579,53 @@ async def fmtotal(interaction: discord.Interaction):
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
 
-@bot.tree.command(name="fmpay", description="Enregistrer un paiement du client sans arrêter la session")
-@app_commands.describe(montant="Montant payé : 20000000, 20 000 000, 20M, 20kk, 1.5M, 500k...")
-async def fmpay(interaction: discord.Interaction, montant: str):
+@bot.tree.command(name="fmpay", description="Paiement du client (20M) ou ajustement au total avec un montant négatif (-1M6)")
+@app_commands.describe(
+    montant="20000000, 20M, 20kk, 1.5M, 500k, 1M6 (= 1,6 million). Négatif (-1M6) : ajouté au montant dû",
+    note="Facultatif : à quoi correspond cette ligne (ex : stock de départ)",
+)
+async def fmpay(interaction: discord.Interaction, montant: str, note: str = ""):
     channel_id = str(interaction.channel.id)
     session = sessions.get(channel_id)
     if session is None:
         return await interaction.response.send_message("Aucune session active.")
 
-    amount = parse_kamas_amount(montant)
+    amount = parse_signed_kamas_amount(montant)
     if amount is None:
         return await interaction.response.send_message(
             f"Montant non compris : « {montant} ». Exemples : `20000000`, `20 000 000`, `20M`, "
-            "`20kk`, `1.5M`, `500k`. Rien n'a été enregistré.", ephemeral=True)
+            "`20kk`, `1.5M`, `500k`, `1M6` (= 1,6 million), ou `-1M6` pour ajouter un stock apporté "
+            "au total. Rien n'a été enregistré.", ephemeral=True)
 
-    session.setdefault("payments", []).append({
-        "amount": amount,
-        "by": str(interaction.user.id),
-        "at": now_iso(),
-    })
+    entry = {"amount": amount, "by": str(interaction.user.id), "at": now_iso()}
+    note = (note or "").strip()[:60]
+    if note:
+        entry["note"] = note
+    session.setdefault("payments", []).append(entry)
     touch_channel(channel_id)
     save_data()
 
+    received, charged = payment_totals(session)
     due = amount_due(session)
-    text = (
-        f"Paiement enregistré : -{format_number(amount)} kamas\n"
-        f"Total dépensé : {format_number(session['total'])} kamas\n"
-        f"Paiements reçus : -{format_number(paid_total(session))} kamas "
-        f"({len(session['payments'])})\n"
-    )
-    if due >= 0:
-        text += f"**Reste à payer : {format_number(due)} kamas**"
+    if amount > 0:
+        head = f"Paiement enregistré : -{format_number(amount)} kamas"
     else:
-        text += (f"**Trop-perçu : {format_number(-due)} kamas**\n"
-                 "⚠️ Ce paiement dépasse le reste dû. Si c'est une erreur : `/fmunpay`.")
-    await interaction.response.send_message(text)
+        head = f"Ajustement enregistré : +{format_number(-amount)} kamas (ajouté au montant dû)"
+    lines = [head + (f" · {note}" if note else ""),
+             f"Total dépensé : {format_number(session['total'])} kamas"]
+    if charged:
+        lines.append(f"Ajustements : +{format_number(charged)} kamas")
+    if received:
+        lines.append(f"Paiements reçus : -{format_number(received)} kamas")
+    if due >= 0:
+        lines.append(f"**Reste à payer : {format_number(due)} kamas**")
+    else:
+        lines.append(f"**Trop-perçu : {format_number(-due)} kamas**")
+        if amount > 0:
+            lines.append("⚠️ Ce paiement dépasse le reste dû. Si c'est une erreur : `/fmunpay`.")
+    await interaction.response.send_message("\n".join(lines))
 
-@bot.tree.command(name="fmunpay", description="Annuler le dernier paiement enregistré avec /fmpay")
+@bot.tree.command(name="fmunpay", description="Annuler le dernier paiement ou ajustement enregistré avec /fmpay")
 async def fmunpay(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
     session = sessions.get(channel_id)
@@ -1402,8 +1638,9 @@ async def fmunpay(interaction: discord.Interaction):
     cancelled = payments.pop()
     touch_channel(channel_id)
     save_data()
+    kind = "Paiement" if cancelled["amount"] > 0 else "Ajustement"
     await interaction.response.send_message(
-        f"Paiement annulé : {format_number(cancelled['amount'])} kamas\n"
+        f"{kind} annulé : {format_number(abs(cancelled['amount']))} kamas\n"
         f"**Reste à payer : {format_number(amount_due(session))} kamas**"
     )
 
@@ -1454,6 +1691,38 @@ async def fmstats(interaction: discord.Interaction, portee: str = "salon"):
             "Aucune tentative enregistrée pour le moment. Elles sont comptées à chaque clic sur le "
             "panneau de suivi.", ephemeral=True)
     await interaction.response.send_message(embed=stats_embed(compute_attempt_stats(entries), label))
+
+@bot.tree.command(name="fmhistorique", description="Historique et records d'un joueur : ses FM, ses commandes, ses séries")
+@app_commands.describe(joueur="Le joueur (toi par défaut)")
+async def fmhistorique(interaction: discord.Interaction, joueur: discord.Member = None):
+    target = joueur or interaction.user
+    player_id = str(target.id)
+    guild = interaction.guild
+
+    def name_of(channel_id):
+        try:
+            found = guild.get_channel(int(channel_id)) if guild else None
+        except (TypeError, ValueError):
+            found = None
+        return getattr(found, "name", "") or ""
+
+    closed = [r for r in fm_state().get("history", []) if r.get("owner") == player_id]
+    records = live_records_of(player_id, name_of) + closed
+    log_entries = [e for e in attempt_log() if e.get("u") == player_id]
+    owned = [cid for cid, e in fm_channels().items() if e.get("owner_id") == player_id]
+    with_data = {r["ch"] for r in records}
+    without_details = len([cid for cid in owned if cid not in with_data])
+
+    if not records and not log_entries:
+        extra = (f" Il a {len(owned)} salon(s) FM plus ancien(s), sans détails enregistrés." if owned else "")
+        return await interaction.response.send_message(
+            f"Aucune FM enregistrée pour {target.display_name}.{extra} L'historique détaillé démarre avec "
+            "cette fonction : seules les sessions fermées ou en cours depuis y figurent.", ephemeral=True)
+
+    profile = compute_player_profile(records, log_entries)
+    await interaction.response.send_message(
+        embed=history_embed(target.display_name, profile, records, len(owned), without_details),
+        ephemeral=True)
 
 @bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")
 async def fmarchive(interaction: discord.Interaction):
@@ -1597,7 +1866,9 @@ async def on_guild_channel_delete(channel):
     entry = fm_channels().get(str(channel.id))
     if entry:
         entry["status"] = "deleted"
-        sessions.pop(str(channel.id), None)
+        deleted_session = sessions.pop(str(channel.id), None)
+        if deleted_session is not None:
+            record_session_history(channel, deleted_session, "deleted")
         panels().pop(str(channel.id), None)
         save_data()
         await send_event(site_event("channel-deleted", f"{channel.id}-deleted", channel))

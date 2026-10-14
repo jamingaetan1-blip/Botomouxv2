@@ -8,6 +8,9 @@ from io import BytesIO
 import asyncio
 import datetime
 import math
+import shutil
+import time
+import traceback
 import re
 import json
 import os
@@ -112,17 +115,91 @@ SESSION_HISTORY_CAP = 500
 SESSION_HISTORY_ITEMS = 40   # objets gardes par session (les plus depenses)
 
 # ---------------- DATA ---------------- #
+# ---------------- SAUVEGARDE DES DONNEES ---------------- #
+# data.json contient les totaux, paiements, historiques et statistiques : il ne doit JAMAIS etre
+# perdu ni corrompu. Ecriture : on serialise d'abord (une donnee invalide ne touche pas au fichier),
+# on ecrit dans un fichier temporaire, puis on le renomme (jamais de fichier a moitie ecrit).
+# Chargement : un fichier illisible n'est plus ignore en silence, il est conserve a cote et le bot
+# repart de la derniere copie de secours valide.
+DATA_PATH = os.environ.get("DATA_PATH", "data.json")
+BACKUP_KEEP = 5              # copies de secours conservees : data.json.bak1 (la plus recente) a .bak5
+BACKUP_MIN_INTERVAL = 300    # au plus une nouvelle copie de secours toutes les 5 minutes
+_last_backup_at = None
+
+def _atomic_write(path, text):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        # Fichier monte seul dans docker (./data.json:/app/data.json) : on ne peut pas le remplacer par
+        # renommage. On ecrit alors directement, le texte etant deja entierement pret en memoire.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+def _rotate_backups(text):
+    global _last_backup_at
+    now = time.monotonic()
+    if _last_backup_at is not None and now - _last_backup_at < BACKUP_MIN_INTERVAL:
+        return
+    _last_backup_at = now
+    for i in range(BACKUP_KEEP, 1, -1):
+        older = f"{DATA_PATH}.bak{i - 1}"
+        if os.path.exists(older):
+            os.replace(older, f"{DATA_PATH}.bak{i}")
+    _atomic_write(f"{DATA_PATH}.bak1", text)   # ecrite depuis la memoire : toujours un JSON valide
+
 def save_data():
-    with open("data.json", "w") as f:
-        json.dump(sessions, f)
+    text = json.dumps(sessions)
+    _atomic_write(DATA_PATH, text)
+    try:
+        _rotate_backups(text)
+    except OSError as exc:
+        print(f"[DATA] copie de secours impossible : {exc}")
+
+def _read_data_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("le fichier ne contient pas un objet JSON")
+    return data
 
 def load_data():
     global sessions
+    if not os.path.exists(DATA_PATH):
+        sessions = {}   # premiere utilisation
+        return
     try:
-        with open("data.json", "r") as f:
-            sessions = json.load(f)
-    except Exception:
-        sessions = {}
+        sessions = _read_data_file(DATA_PATH)
+        return
+    except Exception as exc:
+        print(f"[DATA] ERREUR : {DATA_PATH} est illisible ({exc}).")
+    corrupt = f"{DATA_PATH}.corrupt-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        shutil.copy2(DATA_PATH, corrupt)
+        print(f"[DATA] Fichier abime conserve dans {corrupt}.")
+    except OSError as exc:
+        print(f"[DATA] Impossible de conserver le fichier abime : {exc}")
+    for i in range(1, BACKUP_KEEP + 1):
+        backup = f"{DATA_PATH}.bak{i}"
+        if os.path.exists(backup):
+            try:
+                sessions = _read_data_file(backup)
+                print(f"[DATA] Donnees restaurees depuis {backup} : l'activite des dernieres minutes peut manquer.")
+                return
+            except Exception as exc:
+                print(f"[DATA] {backup} inutilisable ({exc}).")
+    print(f"[DATA] AUCUNE copie de secours utilisable : demarrage a vide. L'ancien fichier reste dans {corrupt}.")
+    sessions = {}
 
 # Les salons FM personnels sont ranges dans data.json sous la cle "_fm" (jamais un
 # identifiant de salon), pour survivre aux redemarrages avec le volume docker actuel.
@@ -1090,6 +1167,25 @@ class AttemptPanelView(discord.ui.View):
         save_data()
         await interaction.response.edit_message(embed=attempts_embed(session))
 
+def split_message(text, limit=1900):
+    """Decoupe un texte en morceaux que Discord accepte (2000 caracteres max), sur des fins de ligne."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:                 # ligne demesuree : coupee
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + 1 + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
 # Ferme la session d'un salon en publiant le meme resume que /fmstop.
 async def close_session_in_channel(channel):
     channel_id = str(channel.id)
@@ -1099,7 +1195,8 @@ async def close_session_in_channel(channel):
     save_data()
     if session is None:
         return False
-    await channel.send(session_summary(session, "Resume final"))
+    for chunk in split_message(session_summary(session, "Resume final")):
+        await channel.send(chunk)
     if session.get("runes"):
         await send_rune_embeds(channel.send, session["runes"])
     await finalize_attempt_panel(channel, session)
@@ -1330,6 +1427,21 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
     await send_event(site_event("session-start", f"{channel.id}-start", channel, author=site_author(member)))
     return channel
 
+def explain_discord_error(exc):
+    """Traduit un refus de Discord en explication utilisable (le texte brut de l'API est peu parlant)."""
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    text = getattr(exc, "text", "") or ""
+    if code == 30013:
+        return ("la catégorie de destination est pleine (Discord limite une catégorie à 50 salons). "
+                "Libère de la place dans la catégorie d'archives, ou change-la.")
+    if code == 50013 or status == 403:
+        return ("il me manque un droit (Gérer les salons, et Gérer les rôles pour modifier les permissions "
+                "d'un salon). Vérifie les droits du rôle du bot.")
+    if status == 429:
+        return "Discord limite temporairement cette action : réessaie dans quelques minutes."
+    return f"Discord a refusé ({status or '?'}{', code ' + str(code) if code else ''}) : {text or 'sans précision'}"
+
 async def archive_fm_channel(channel, message):
     entry = fm_channels().get(str(channel.id))
     if not entry or entry.get("status") != "active":
@@ -1337,8 +1449,6 @@ async def archive_fm_channel(channel, message):
     # Un salon peut etre rouvert puis archive de nouveau : chaque archivage a ses propres identifiants
     # d'evenement, sinon le site prendrait le second pour un doublon du premier.
     archived_at = now_iso()
-    if await close_session_in_channel(channel):
-        await send_event(site_event("session-stop", f"{channel.id}-archive-stop-{archived_at}", channel))
 
     guild = channel.guild
     overwrites = dict(channel.overwrites)
@@ -1348,6 +1458,10 @@ async def archive_fm_channel(channel, message):
     archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
     if archive is None and await ensure_fm_places(guild):
         archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
+
+    # 1. Le deplacement D'ABORD : c'est l'etape que Discord peut refuser (categorie pleine, droit
+    #    manquant, limite de debit). Si elle echoue, rien n'a ete ferme : la session, ses totaux et son
+    #    panneau sont intacts et l'appelant peut afficher la raison.
     await channel.edit(
         category=archive or channel.category,
         overwrites=overwrites,
@@ -1355,7 +1469,15 @@ async def archive_fm_channel(channel, message):
     entry["status"] = "archived"
     entry["archived_at"] = archived_at
     save_data()
-    await channel.send(message)
+
+    # 2. Le salon est archive : on clot la session et on publie le resume. Un echec d'envoi ici ne doit
+    #    pas annuler l'archivage (l'historique de la session est deja enregistre avant l'envoi).
+    try:
+        if await close_session_in_channel(channel):
+            await send_event(site_event("session-stop", f"{channel.id}-archive-stop-{archived_at}", channel))
+        await channel.send(message)
+    except discord.HTTPException as exc:
+        print(f"[ARCHIVAGE] #{getattr(channel, 'name', '?')} archive, mais resume ou message non envoye : {exc}")
     await send_event(site_event("channel-archived", f"{channel.id}-archived-{archived_at}", channel))
 
 # Rouvre un salon FM archive, a la demande du site (« Rouvrir » une seance de FM) : le meme salon
@@ -1544,12 +1666,17 @@ async def fmstop(interaction: discord.Interaction):
     runes = session.get("runes", {})
     message_out = session_summary(session, "Resume final")
 
+    # Le resume est envoye AVANT de fermer la session : si Discord refuse l'envoi, rien n'est perdu
+    # et la commande peut etre relancee.
+    chunks = split_message(message_out)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
     record_session_history(interaction.channel, session, "stop")
     del sessions[channel_id]
     touch_channel(channel_id)
     save_data()
-
-    await interaction.response.send_message(message_out)
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
     await send_event(site_event("session-stop", interaction.id, interaction.channel, interaction.created_at))
@@ -1575,7 +1702,10 @@ async def fmtotal(interaction: discord.Interaction):
     runes = session.get("runes", {})
     message_out = session_summary(session, "Etat actuel")
 
-    await interaction.response.send_message(message_out)
+    chunks = split_message(message_out)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
     if runes:
         await send_rune_embeds(interaction.followup.send, runes)
 
@@ -1732,7 +1862,18 @@ async def fmarchive(interaction: discord.Interaction):
     if entry.get("owner_id") != str(interaction.user.id):
         return await interaction.response.send_message("Seul le proprietaire du salon peut l'archiver.", ephemeral=True)
     await interaction.response.send_message("Archivage du salon...")
-    await archive_fm_channel(interaction.channel, "Salon archive : il reste consultable en lecture seule.")
+    try:
+        await archive_fm_channel(interaction.channel, "Salon archive : il reste consultable en lecture seule.")
+    except discord.HTTPException as exc:
+        print(f"[ARCHIVAGE] echec dans #{getattr(interaction.channel, 'name', '?')} : {exc!r}")
+        await interaction.edit_original_response(content=(
+            f"❌ Archivage impossible : {explain_discord_error(exc)}\n"
+            "Rien n'a été modifié : la session et son panneau sont intacts."))
+        return
+    try:
+        await interaction.edit_original_response(content="✅ Salon archivé.")
+    except discord.HTTPException:
+        pass
 
 @bot.command()
 async def sync(ctx):
@@ -1822,6 +1963,23 @@ async def archive_inactive_channels():
             await archive_fm_channel(channel, f"Salon archive automatiquement apres {FM_INACTIVITY_DAYS} jours sans activite.")
 
 # ---------------- EVENTS ---------------- #
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    """Filet de securite : une commande qui plante ne laisse plus l'utilisateur devant un message figé."""
+    original = getattr(error, "original", error)
+    name = getattr(getattr(interaction, "command", None), "name", "?")
+    print(f"[COMMANDE] /{name} a echoue : {original!r}")
+    traceback.print_exception(type(original), original, original.__traceback__)
+    message = (f"⚠️ La commande /{name} a rencontré une erreur ({type(original).__name__}). "
+               "Le détail est dans les logs du bot.")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
 @bot.event
 async def setup_hook():
     bot.add_view(NewSessionView())

@@ -1548,7 +1548,7 @@ def item_autocomplete_choices(current, limit=25):
 # Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
 # n'importe quel navigateur, suit le theme clair/sombre et s'imprime proprement (PDF pour un client).
 REPORT_CSS = """
-:root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--bar:#a5b4fc}
+:root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--bar:#a5b4fc;--tile:80px;--tile-img:64px}
 @media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--bar:#4a52a8}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -1569,12 +1569,17 @@ h3{font-size:.95rem;margin:0}
 .day h3{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);color:var(--muted);font-weight:600}
 .day h3 .daytotal{color:var(--text)}
 .tl{list-style:none;margin:12px 0 0 6px;padding:0 0 0 24px;border-left:2px solid var(--line)}
-.tl li{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 10px}
+.tl li{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 10px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 16px;align-items:start}
+.tl li.has-tile{grid-template-columns:minmax(0,1fr) auto auto}
+.main{min-width:0}
+.tile{align-self:center;display:flex;align-items:center;justify-content:center;width:var(--tile,80px);height:var(--tile,80px);background:var(--bg);border:1px solid var(--line);border-radius:14px}
+.tile img{width:var(--tile-img,64px);height:var(--tile-img,64px);object-fit:contain}
+@media (max-width:640px){.tl li,.tl li.has-tile{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"main main" "tile amt"}.tl li .main{grid-area:main}.tl li .tile{grid-area:tile}.tl li .amt{grid-area:amt;align-self:center}}
 .tl li::before{content:"";position:absolute;left:-32px;top:18px;width:10px;height:10px;border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
 .row1{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
 .when{color:var(--muted);font-variant-numeric:tabular-nums}
 .name{font-weight:650;overflow-wrap:anywhere}
-.amt{font-weight:700;margin-left:auto}
+.amt{font-weight:700;white-space:nowrap;text-align:right}
 .meta{color:var(--muted);font-size:.84rem;margin-top:6px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .chip{font-size:.8rem;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:1px 9px;max-width:100%;overflow-wrap:anywhere}
@@ -1609,7 +1614,6 @@ th[aria-sort=descending]::after{content:" ▼";font-size:.7em}
 .rname{display:flex;align-items:center;gap:10px;text-align:left}
 .warn{color:var(--warn)}
 .chip.item{display:inline-flex;align-items:center;gap:6px;font-weight:600;border-color:var(--accent)}
-.ico.sm{width:22px;height:22px}
 .lv{color:var(--muted);font-weight:400}
 @media print{.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
 """
@@ -1750,21 +1754,25 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 if owner:
                     chips.append(f'<span class="chip who">{esc(owner)}</span>')
                 linked = r.get("item")
+                tile = ""
                 if linked:
                     uri = (item_icons or {}).get(linked["id"])
-                    pic = f'<img class="ico sm" alt="" src="{uri}" width="22" height="22">' if uri else ""
                     lvl = f" · niv. {linked['level']}" if linked.get("level") else ""
-                    chips.insert(0, f'<span class="chip item">{pic}{esc(linked["name"] + lvl)}</span>')
+                    label = linked["name"] + lvl
+                    chips.insert(0, f'<span class="chip item">{esc(label)}</span>')
+                    if uri:   # grande vignette carree entre le contenu et le montant
+                        tile = f'<div class="tile" title="{esc(label)}"><img src="{uri}" alt="" width="64" height="64"></div>'
                 top = list((r.get("items") or {}).items())[:3]
                 items_line = ""
                 if top:
                     items_line = ('<div class="meta">' + esc(" · ".join(
                         f"{name} ({_kamas_short(price)})" for name, (_q, price) in top)) + "</div>")
                 parts.append(
-                    f'<li><div class="row1"><span class="when">{when.strftime("%H:%M")}</span>'
-                    f'<span class="name">#{esc(r.get("name") or "salon")}</span>{badge}'
-                    f'<span class="amt">{amount(record_amount(r))} kamas</span></div>'
-                    f'<div class="chips">{"".join(chips)}</div>{items_line}</li>')
+                    ('<li class="has-tile">' if tile else "<li>") + '<div class="main"><div class="row1">'
+                    f'<span class="when">{when.strftime("%H:%M")}</span>'
+                    f'<span class="name">#{esc(r.get("name") or "salon")}</span>{badge}</div>'
+                    f'<div class="chips">{"".join(chips)}</div>{items_line}</div>'
+                    + tile + f'<div class="amt">{amount(record_amount(r))} kamas</div></li>')
             parts.append("</ol></section>")
 
     # ---- graphique : depense par mois ----

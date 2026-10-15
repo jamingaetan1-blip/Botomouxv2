@@ -2947,10 +2947,36 @@ async def fmarchive(interaction: discord.Interaction):
     except discord.HTTPException:
         pass
 
+async def sync_commands():
+    """
+    Synchronise les commandes slash avec Discord. Ne leve JAMAIS : une erreur ici ne doit pas empecher le reste
+    du demarrage. Journalise exactement ce que Discord a accepte ou refuse. Retourne (noms synchronises, erreur).
+    """
+    local = sorted(command.name for command in bot.tree.get_commands())
+    try:
+        synced = await bot.tree.sync()
+    except Exception as exc:
+        # Le message de Discord nomme la commande et le champ refuses (ex : description trop longue).
+        print(f"[SYNC] ECHEC de la synchronisation : {exc}")
+        print(f"[SYNC] commandes definies dans le code ({len(local)}) : {', '.join(local)}")
+        return [], exc
+    names = sorted(command.name for command in synced)
+    print(f"[SYNC] {len(names)} commandes synchronisees : {', '.join(names)}")
+    missing = [name for name in local if name not in names]
+    if missing:
+        print(f"[SYNC] ATTENTION, definies dans le code mais absentes de la reponse de Discord : {', '.join(missing)}")
+    return names, None
+
+# Commande a prefixe : utilisable dans N'IMPORTE QUEL salon (session ou non), reservee aux administrateurs.
 @bot.command()
 async def sync(ctx):
-    await bot.tree.sync()
-    await ctx.send("Commandes synchronisees !")
+    perms = getattr(ctx.author, "guild_permissions", None)
+    if not (perms and perms.administrator):
+        return await ctx.send("Commande réservée aux administrateurs du serveur.")
+    names, error = await sync_commands()
+    if error is not None:
+        return await ctx.send(f"❌ Synchronisation refusée par Discord : {str(error)[:1500]}")
+    await ctx.send(f"✅ {len(names)} commandes synchronisées : " + ", ".join(f"/{n}" for n in names))
 
 # ---------------- TACHES DE FOND ---------------- #
 # Toutes les 10 secondes : les demandes du site (ouvrir / fermer une session,
@@ -3060,7 +3086,7 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     load_data()
-    await bot.tree.sync()
+    await sync_commands()
     print(f"Bot connecte en tant que {bot.user}")
     if FM_PERSONAL_CHANNELS:
         await ensure_button_emoji()
@@ -3109,13 +3135,11 @@ async def on_message(message):
         return
 
     channel_id = str(message.channel.id)
-    if channel_id not in sessions:
+    if channel_id not in sessions or not sessions[channel_id].get("active", True):
+        await bot.process_commands(message)   # commandes a prefixe (!sync) : aussi hors session
         return
 
     session = sessions[channel_id]
-    if not session["active"]:
-        return
-
     session.setdefault("runes", {})
 
     images = [a for a in message.attachments if a.filename.lower().endswith(("png", "jpg", "jpeg"))]

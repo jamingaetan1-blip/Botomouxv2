@@ -7,6 +7,7 @@ import requests
 from io import BytesIO
 import asyncio
 import datetime
+import html as html_lib
 import math
 import shutil
 import time
@@ -16,7 +17,8 @@ import json
 import os
 import unicodedata
 import hashlib
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import defaultdict, Counter
 
 # ---------------- CONFIG ---------------- #
@@ -808,19 +810,23 @@ def record_session_history(channel, session, why):
         channel.id, getattr(channel, "name", ""), entry.get("owner_id"), session, now_iso(), why))
     del history[:-SESSION_HISTORY_CAP]
 
-def live_records_of(player_id, name_of):
-    """Sessions EN COURS d'un joueur, au meme format que les sessions terminees."""
+def live_records(name_of, player_id=None):
+    """Sessions EN COURS (d'un joueur, ou de tous si player_id est None), au format des sessions terminees."""
     records = []
     for channel_id, entry in fm_channels().items():
-        if entry.get("owner_id") != str(player_id):
+        owner = entry.get("owner_id")
+        if player_id is not None and owner != str(player_id):
             continue
         session = sessions.get(channel_id)
         if session is None or not session_has_activity(session):
             continue
-        record = build_session_record(channel_id, name_of(channel_id), str(player_id), session, None, "live")
+        record = build_session_record(channel_id, name_of(channel_id), owner, session, None, "live")
         record["live"] = True
         records.append(record)
     return records
+
+def live_records_of(player_id, name_of):
+    return live_records(name_of, player_id)
 
 def longest_streaks(entries):
     """
@@ -963,6 +969,430 @@ def history_embed(display_name, profile, records, owned_total, without_details):
     embed.set_footer(text="Historique détaillé depuis la mise en place de cette fonction. Montant d'une "
                           "commande = achats + stock apporté, avant paiements.")
     return embed
+
+# ---------------- BILAN : PERIODES ET TOTAUX ---------------- #
+# /fmbilan produit une page HTML autonome : chronologie des sessions d'une periode + totaux par mois,
+# trimestre et annee. Les dates sont enregistrees en UTC ; les mois, trimestres et annees se lisent dans
+# le fuseau REPORT_TIMEZONE (sinon une session fermee a 00h30 le 1er serait comptee dans le mois precedent).
+REPORT_TIMEZONE = os.environ.get("REPORT_TIMEZONE", "Europe/Paris")
+MONTHS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre",
+             "octobre", "novembre", "décembre"]
+MONTHS_SHORT_FR = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+DAYS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+PERIOD_HELP = ("Formats acceptés : mois → `2026-09`, `09/2026`, `septembre` ou `septembre 2026` ; "
+               "trimestre → `2026-T3`, `T3-2026` ou `T3` ; année → `2026`. "
+               "Sans année, c'est la plus récente qui correspond.")
+
+def report_tz():
+    try:
+        return ZoneInfo(REPORT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        print(f"[BILAN] fuseau {REPORT_TIMEZONE!r} introuvable (paquet tzdata manquant ?) : UTC utilisé.")
+        return datetime.timezone.utc
+
+def _norm(text):
+    return "".join(c for c in unicodedata.normalize("NFD", (text or "").lower())
+                   if unicodedata.category(c) != "Mn").strip()
+
+_MONTH_BY_NAME = {_norm(name): i + 1 for i, name in enumerate(MONTHS_FR)}
+
+def _first_of(year, month, tz):
+    return datetime.datetime(year, month, 1, tzinfo=tz)
+
+def _add_months(year, month, count):
+    index = year * 12 + (month - 1) + count
+    return index // 12, index % 12 + 1
+
+def parse_report_period(kind, spec, now):
+    """
+    Retourne (debut, fin_exclue, libelle) en heure locale ; (None, None, libelle) pour « tout ».
+    kind : mois | trimestre | annee | tout. Leve ValueError (message pret a afficher) si spec est illisible.
+    """
+    tz = now.tzinfo
+    text = _norm(spec)
+    if kind == "tout":
+        return None, None, "Toutes les données"
+
+    if kind == "annee":
+        if not text:
+            year = now.year
+        elif re.fullmatch(r"\d{4}", text):
+            year = int(text)
+        else:
+            raise ValueError(f"Année non comprise : « {spec} ». {PERIOD_HELP}")
+        if not 2000 <= year <= 2100:
+            raise ValueError(f"Année improbable : {year}. {PERIOD_HELP}")
+        return _first_of(year, 1, tz), _first_of(year + 1, 1, tz), f"Année {year}"
+
+    if kind == "trimestre":
+        if not text:
+            year, quarter = now.year, (now.month - 1) // 3 + 1
+        else:
+            m = re.fullmatch(r"(\d{4})\s*[-/ ]*\s*[tq]\s*([1-4])", text)
+            if m:
+                year, quarter = int(m.group(1)), int(m.group(2))
+            else:
+                m = re.fullmatch(r"[tq]\s*([1-4])(?:\s*[-/ ]*\s*(\d{4}))?", text)
+                if not m:
+                    raise ValueError(f"Trimestre non compris : « {spec} ». {PERIOD_HELP}")
+                quarter = int(m.group(1))
+                if m.group(2):
+                    year = int(m.group(2))
+                else:   # sans annee : le plus recent, jamais dans le futur
+                    year = now.year if quarter <= (now.month - 1) // 3 + 1 else now.year - 1
+        if not 2000 <= year <= 2100:
+            raise ValueError(f"Année improbable : {year}. {PERIOD_HELP}")
+        first = 3 * (quarter - 1) + 1
+        end_year, end_month = _add_months(year, first, 3)
+        label = f"T{quarter} {year} ({MONTHS_FR[first - 1]} à {MONTHS_FR[first + 1]})"
+        return _first_of(year, first, tz), _first_of(end_year, end_month, tz), label
+
+    # mois (defaut)
+    if not text:
+        year, month = now.year, now.month
+    else:
+        m = re.fullmatch(r"(\d{4})\s*[-/.]\s*(\d{1,2})", text)
+        if m:
+            year, month = int(m.group(1)), int(m.group(2))
+        else:
+            m = re.fullmatch(r"(\d{1,2})\s*[-/.]\s*(\d{4})", text)
+            if m:
+                month, year = int(m.group(1)), int(m.group(2))
+            else:
+                m = re.fullmatch(r"([a-z]+)(?:\s+(\d{4}))?", text)
+                if not m or m.group(1) not in _MONTH_BY_NAME:
+                    raise ValueError(f"Mois non compris : « {spec} ». {PERIOD_HELP}")
+                month = _MONTH_BY_NAME[m.group(1)]
+                if m.group(2):
+                    year = int(m.group(2))
+                else:   # sans annee : le plus recent, jamais dans le futur
+                    year = now.year if month <= now.month else now.year - 1
+    if not 1 <= month <= 12:
+        raise ValueError(f"Mois invalide : {month}. {PERIOD_HELP}")
+    if not 2000 <= year <= 2100:
+        raise ValueError(f"Année improbable : {year}. {PERIOD_HELP}")
+    end_year, end_month = _add_months(year, month, 1)
+    return _first_of(year, month, tz), _first_of(end_year, end_month, tz), f"{MONTHS_FR[month - 1].capitalize()} {year}"
+
+def record_when(record, tz):
+    """Date a laquelle une session compte : sa fermeture (son debut si elle est en cours), heure locale."""
+    keys = ("start", "end") if record.get("live") else ("end", "start")
+    for key in keys:
+        raw = record.get(key)
+        if not raw:
+            continue
+        try:
+            moment = datetime.datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.astimezone(tz)
+    return None
+
+def _new_agg():
+    return {"n": 0, "total": 0, "adjust": 0, "paid": 0, "tries": 0, "target": 0}
+
+def _add_agg(agg, record):
+    agg["n"] += 1
+    agg["total"] += record["total"]
+    agg["adjust"] += record.get("adjust", 0)
+    agg["paid"] += record.get("paid", 0)
+    counts = record.get("attempts") or {}
+    agg["tries"] += sum(counts.values())
+    agg["target"] += counts.get(FM_OUTCOMES[0][0], 0)
+
+def _period_bounds(kind, key, tz):
+    if kind == "month":
+        year, month = key
+        end = _add_months(year, month, 1)
+        return _first_of(year, month, tz), _first_of(end[0], end[1], tz)
+    if kind == "quarter":
+        year, quarter = key
+        first = 3 * (quarter - 1) + 1
+        end = _add_months(year, first, 3)
+        return _first_of(year, first, tz), _first_of(end[0], end[1], tz)
+    return _first_of(key, 1, tz), _first_of(key + 1, 1, tz)
+
+def _overlaps(start, end, a, b):
+    return start is None or (a < end and b > start)
+
+def build_report(records, tz, start, end, label, now, player_label=None, sample=False):
+    """Toutes les donnees de la page : sessions de la periode, totaux par mois/trimestre/annee, joueurs, objets."""
+    dated, undated = [], 0
+    for record in records:
+        when = record_when(record, tz)
+        if when is None:
+            undated += 1
+        else:
+            dated.append((when, record))
+    dated.sort(key=lambda pair: pair[0])
+    timeline = [(w, r) for w, r in dated if start is None or start <= w < end]
+
+    period, players, items = _new_agg(), {}, {}
+    for _w, r in timeline:
+        _add_agg(period, r)
+        _add_agg(players.setdefault(r.get("owner"), _new_agg()), r)
+        for name, (qty, price) in (r.get("items") or {}).items():
+            cur = items.setdefault(name, [0, 0])
+            cur[0] += qty
+            cur[1] += price
+    by_month, by_quarter, by_year = {}, {}, {}
+    for w, r in dated:
+        _add_agg(by_month.setdefault((w.year, w.month), _new_agg()), r)
+        _add_agg(by_quarter.setdefault((w.year, (w.month - 1) // 3 + 1), _new_agg()), r)
+        _add_agg(by_year.setdefault(w.year, _new_agg()), r)
+
+    if end is not None:
+        anchor = end - datetime.timedelta(microseconds=1)
+    elif dated:
+        anchor = dated[-1][0]
+    else:
+        anchor = now
+    chart, (year, month) = [], (anchor.year, anchor.month)
+    for _ in range(12):
+        chart.append(((year, month), by_month.get((year, month), _new_agg())))
+        year, month = _add_months(year, month, -1)
+    chart.reverse()
+
+    return {
+        "label": label, "start": start, "end": end, "tz": tz, "now": now, "player": player_label,
+        "sample": sample, "timeline": timeline, "period": period, "players": players,
+        "top_items": sorted(items.items(), key=lambda kv: -kv[1][1])[:5],
+        "by_month": by_month, "by_quarter": by_quarter, "by_year": by_year, "chart": chart,
+        "first": dated[0][0] if dated else None, "undated": undated,
+    }
+
+# ---------------- BILAN : PAGE HTML ---------------- #
+# Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
+# n'importe quel navigateur, suit le theme clair/sombre et s'imprime proprement (PDF pour un client).
+REPORT_CSS = """
+:root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--bar:#a5b4fc}
+@media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--bar:#4a52a8}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:980px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:1.7rem;margin:0 0 4px}
+h2{font-size:1.15rem;margin:36px 0 12px}
+h3{font-size:.95rem;margin:0}
+.sub{color:var(--muted);margin:0 0 22px}
+.banner{background:var(--accent-soft);border:1px solid var(--accent);border-radius:10px;padding:10px 14px;margin:0 0 18px}
+.kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:560px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.kpi b{font-size:1rem;white-space:normal;overflow-wrap:anywhere}.kpi .n{white-space:normal}}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.kpi .lab{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+.kpi b{display:block;font-size:1.2rem;margin-top:2px;white-space:nowrap}
+.kpi small{color:var(--muted);display:block;font-size:.8rem}
+.n{white-space:nowrap;font-variant-numeric:tabular-nums}
+.day{margin:20px 0 6px}
+.day h3{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);color:var(--muted);font-weight:600}
+.day h3 .daytotal{color:var(--text)}
+.tl{list-style:none;margin:12px 0 0 6px;padding:0 0 0 24px;border-left:2px solid var(--line)}
+.tl li{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 10px}
+.tl li::before{content:"";position:absolute;left:-32px;top:18px;width:10px;height:10px;border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
+.row1{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+.when{color:var(--muted);font-variant-numeric:tabular-nums}
+.name{font-weight:650;overflow-wrap:anywhere}
+.amt{font-weight:700;margin-left:auto}
+.meta{color:var(--muted);font-size:.84rem;margin-top:6px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:.8rem;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:1px 9px;max-width:100%;overflow-wrap:anywhere}
+.chip.who{color:var(--accent);border-color:var(--accent)}
+.badge{display:inline-block;font-size:.72rem;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
+.badge.live{color:var(--ok);border-color:var(--ok)}
+.badge.del{color:var(--warn);border-color:var(--warn)}
+.scroll{overflow-x:auto;border-radius:12px}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);font-size:.9rem}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.04em}
+tr:last-child td{border-bottom:0}
+tr.sel td{background:var(--accent-soft)}
+.chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px}
+.chart svg{width:100%;height:auto;display:block}
+.bar{fill:var(--bar)}
+.bar.sel{fill:var(--accent)}
+.lbl{fill:var(--muted);font-size:11px;text-anchor:middle}
+.val{fill:var(--text);font-size:11px;text-anchor:middle}
+.notes{color:var(--muted);font-size:.85rem;margin-top:36px}
+.notes li{margin:3px 0}
+.empty{color:var(--muted);padding:18px;border:1px dashed var(--line);border-radius:12px}
+@media print{body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
+"""
+
+def _kamas_short(n):
+    """Montant abrege pour le graphique : 193 450 000 -> « 193,5 M ». Arrondi decimal (jamais flottant)."""
+    sign, n = ("-" if n < 0 else ""), abs(n)
+    units = [(1_000_000_000, " Md"), (1_000_000, " M"), (1_000, " k")]
+    for i, (divisor, unit) in enumerate(units):
+        if n < divisor:
+            continue
+        value = (Decimal(n) / Decimal(divisor)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        if value >= 1000 and i > 0:   # 999 999 -> « 1000 k » : on passe a l'unite superieure -> « 1 M »
+            divisor, unit = units[i - 1]
+            value = (Decimal(n) / Decimal(divisor)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        return sign + f"{value:f}".rstrip("0").rstrip(".").replace(".", ",") + unit
+    return f"{sign}{n}"
+
+def render_report_html(report, owner_name_of):
+    esc = html_lib.escape
+    tz, start, end = report["tz"], report["start"], report["end"]
+    period = report["period"]
+    _k, target_label, target_emoji, _s = FM_OUTCOMES[0]
+
+    def amount(n):
+        return f'<span class="n">{format_number(n)}</span>'
+
+    def rate(agg):
+        return f"{agg['target'] * 100 / agg['tries']:.0f} %" if agg["tries"] else "—"
+
+    def agg_cells(agg):
+        return [str(agg["n"]), amount(agg["total"]), amount(agg["adjust"]), amount(agg["total"] + agg["adjust"]),
+                amount(agg["paid"]), str(agg["tries"]), f"{agg['target']} ({rate(agg)})" if agg["tries"] else "—"]
+
+    headers = ["Sessions", "Dépensé", "Stock ajouté", "Facturé", "Payé", "Tentatives", target_label]
+
+    def table(first_header, rows):
+        head = "".join(f"<th>{esc(h)}</th>" for h in [first_header] + headers)
+        body = "".join(
+            ('<tr class="sel">' if sel else "<tr>")
+            + f"<td>{esc(label)}</td>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+            for label, cells, sel in rows)
+        return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+    # ---- en-tete ----
+    parts = [f'<h1>Bilan FM · {esc(report["label"])}</h1>']
+    scope = f"Joueur : {esc(report['player'])}" if report["player"] else "Tous les joueurs"
+    parts.append(f'<p class="sub">{scope} · généré le {report["now"].strftime("%d/%m/%Y à %H:%M")} '
+                 f'({esc(str(tz))})</p>')
+    if report["sample"]:
+        parts.insert(0, '<div class="banner"><b>Données d\'exemple</b> : cette page illustre le rendu, '
+                        'elle ne contient aucune vraie session.</div>')
+
+    # ---- cartes ----
+    cards = [("Sessions", str(period["n"]), ""),
+             ("Dépensé", amount(period["total"]), "kamas, achats"),
+             ("Stock ajouté", amount(period["adjust"]), "kamas, ajustements"),
+             ("Facturé", amount(period["total"] + period["adjust"]), "kamas, dépensé + stock"),
+             ("Payé", amount(period["paid"]), "kamas, enregistré"),
+             ("Tentatives", str(period["tries"]), f"{target_emoji} {period['target']} · {rate(period)}")]
+    parts.append('<div class="kpis">' + "".join(
+        f'<div class="kpi"><span class="lab">{esc(t)}</span><b>{v}</b><small>{esc(sub)}</small></div>' for t, v, sub in cards) + "</div>")
+
+    # ---- chronologie ----
+    parts.append("<h2>Chronologie</h2>")
+    if not report["timeline"]:
+        parts.append('<div class="empty">Aucune session sur cette période.</div>')
+    else:
+        days = {}
+        for when, record in report["timeline"]:
+            days.setdefault(when.date(), []).append((when, record))
+        for day, rows in days.items():
+            title = f"{DAYS_FR[day.weekday()].capitalize()} {day.day} {MONTHS_FR[day.month - 1]} {day.year}"
+            day_total = sum(record_amount(r) for _w, r in rows)
+            parts.append(f'<section class="day"><h3><span class="d">{esc(title)}</span>'
+                         f'<span class="daytotal">{amount(day_total)} kamas</span></h3><ol class="tl">')
+            for when, r in rows:
+                if r.get("live"):
+                    badge = '<span class="badge live">en cours</span>'
+                elif r.get("why") == "deleted":
+                    badge = '<span class="badge del">salon supprimé</span>'
+                else:
+                    badge = '<span class="badge">terminée</span>'
+                owner = owner_name_of(r.get("owner")) if r.get("owner") else None
+                counts = r.get("attempts") or {}
+                tries = sum(counts.values())
+                money = [f"dépensé {format_number(r['total'])}"]
+                if r.get("adjust"):
+                    money.append(f"stock +{format_number(r['adjust'])}")
+                if r.get("paid"):
+                    money.append(f"payé {format_number(r['paid'])}")
+                chips = ["".join(f'<span class="chip">{esc(m)}</span>' for m in money)]
+                if tries:
+                    chips.append('<span class="chip">' + esc("  ".join(
+                        f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)) + "</span>")
+                if owner:
+                    chips.append(f'<span class="chip who">{esc(owner)}</span>')
+                top = list((r.get("items") or {}).items())[:3]
+                items_line = ""
+                if top:
+                    items_line = ('<div class="meta">' + esc(" · ".join(
+                        f"{name} ({_kamas_short(price)})" for name, (_q, price) in top)) + "</div>")
+                parts.append(
+                    f'<li><div class="row1"><span class="when">{when.strftime("%H:%M")}</span>'
+                    f'<span class="name">#{esc(r.get("name") or "salon")}</span>{badge}'
+                    f'<span class="amt">{amount(record_amount(r))} kamas</span></div>'
+                    f'<div class="chips">{"".join(chips)}</div>{items_line}</li>')
+            parts.append("</ol></section>")
+
+    # ---- graphique : depense par mois ----
+    chart = report["chart"]
+    width, height, top, bottom, left = 720, 210, 26, 34, 8
+    biggest = max((a["total"] for _k2, a in chart), default=0) or 1
+    slot = (width - 2 * left) / len(chart)
+    svg = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Montant dépensé par mois sur 12 mois">']
+    for i, ((year, month), agg) in enumerate(chart):
+        bar_h = (height - top - bottom) * agg["total"] / biggest
+        x, w = left + i * slot + slot * 0.14, slot * 0.72
+        y = height - bottom - bar_h
+        a, b = _period_bounds("month", (year, month), tz)
+        selected = _overlaps(start, end, a, b) and start is not None
+        name = f"{MONTHS_FR[month - 1].capitalize()} {year}"
+        svg.append(f'<rect class="bar{" sel" if selected else ""}" x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" '
+                   f'height="{bar_h:.1f}" rx="4"><title>{esc(name)} : {format_number(agg["total"])} kamas</title></rect>')
+        if agg["total"]:
+            svg.append(f'<text class="val" x="{x + w / 2:.1f}" y="{y - 5:.1f}">{esc(_kamas_short(agg["total"]))}</text>')
+        label = MONTHS_SHORT_FR[month - 1] + (f" {str(year)[2:]}" if month == 1 or i == 0 else "")
+        svg.append(f'<text class="lbl" x="{x + w / 2:.1f}" y="{height - 12}">{esc(label)}</text>')
+    svg.append("</svg>")
+    parts.append("<h2>Dépensé par mois</h2>")
+    parts.append('<div class="chart">' + "".join(svg) + "</div>")
+
+    # ---- totaux par mois / trimestre / annee ----
+    def sel(kind, key):
+        a, b = _period_bounds(kind, key, tz)
+        return start is not None and _overlaps(start, end, a, b)
+
+    for title, first_header, kind, data, label_fn in (
+            ("Par mois", "Mois", "month", report["by_month"], lambda k: f"{MONTHS_FR[k[1] - 1].capitalize()} {k[0]}"),
+            ("Par trimestre", "Trimestre", "quarter", report["by_quarter"], lambda k: f"T{k[1]} {k[0]}"),
+            ("Par année", "Année", "year", report["by_year"], lambda k: str(k))):
+        parts.append(f"<h2>{title}</h2>")
+        if not data:
+            parts.append('<div class="empty">Aucune donnée.</div>')
+            continue
+        rows = [(label_fn(k), agg_cells(data[k]), sel(kind, k)) for k in sorted(data, reverse=True)]
+        parts.append(table(first_header, rows))
+
+    # ---- par joueur / objets ----
+    if len(report["players"]) > 1:
+        parts.append("<h2>Par joueur (période affichée)</h2>")
+        ordered = sorted(report["players"].items(), key=lambda kv: -(kv[1]["total"] + kv[1]["adjust"]))
+        parts.append(table("Joueur", [
+            ((owner_name_of(o) if o else "(salon sans propriétaire)"), agg_cells(a), False) for o, a in ordered]))
+    if report["top_items"]:
+        parts.append("<h2>Objets les plus dépensés (période affichée)</h2>")
+        body = "".join(f"<tr><td>{esc(name)}</td><td>{format_number(qty)}</td><td>{amount(price)}</td></tr>"
+                       for name, (qty, price) in report["top_items"])
+        parts.append('<div class="scroll"><table><thead><tr><th>Objet</th><th>Quantité</th><th>Dépensé</th></tr></thead>'
+                     f"<tbody>{body}</tbody></table></div>")
+
+    # ---- notes ----
+    first = report["first"].strftime("%d/%m/%Y") if report["first"] else "—"
+    notes = [f"Données enregistrées depuis le {first} : les sessions fermées avant la mise en place de l'historique n'y figurent pas.",
+             "Une session compte à la date de sa fermeture (à la date de son début si elle est en cours).",
+             "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Payé = paiements enregistrés "
+             "pendant la session : un règlement fait après la fermeture n'est pas connu du bot.",
+             f"Mois, trimestres et années sont lus en heure de {esc(str(tz))}."]
+    if report["undated"]:
+        notes.append(f"{report['undated']} session(s) sans date lisible n'apparaissent pas dans la chronologie ni dans les totaux.")
+    parts.append('<ul class="notes">' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>")
+
+    return ("<!DOCTYPE html>\n<html lang=\"fr\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">"
+            f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}</style></head><body><main>"
+            + "".join(parts) + "</main></body></html>")
 
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
 # Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
@@ -1589,6 +2019,7 @@ def channel_welcome_embed():
             "`/fmpanel` · reposter le panneau de suivi des tentatives\n"
             "`/fmstats` · statistiques de tes tentatives (taux de réussite, rythme)\n"
             "`/fmhistorique` · ton historique et tes records (ou ceux d'un autre joueur)\n"
+            "`/fmbilan` · page de bilan : chronologie et totaux par mois, trimestre, année\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -1852,6 +2283,73 @@ async def fmhistorique(interaction: discord.Interaction, joueur: discord.Member 
     profile = compute_player_profile(records, log_entries)
     await interaction.response.send_message(
         embed=history_embed(target.display_name, profile, records, len(owned), without_details),
+        ephemeral=True)
+
+@bot.tree.command(name="fmbilan", description="Page de bilan : chronologie des sessions et totaux par mois, trimestre, année")
+@app_commands.describe(
+    periode="Période détaillée dans la chronologie (mois par défaut)",
+    repere="Facultatif : 2026-09, septembre, T3-2026, 2026... (sinon la période en cours)",
+    joueur="Facultatif : se limiter aux sessions d'un seul joueur",
+)
+@app_commands.choices(periode=[
+    app_commands.Choice(name="Mois", value="mois"),
+    app_commands.Choice(name="Trimestre", value="trimestre"),
+    app_commands.Choice(name="Année", value="annee"),
+    app_commands.Choice(name="Tout", value="tout"),
+])
+async def fmbilan(interaction: discord.Interaction, periode: str = "mois", repere: str = "",
+                  joueur: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    tz = report_tz()
+    now = datetime.datetime.now(tz)
+    try:
+        start, end, label = parse_report_period(periode, repere, now)
+    except ValueError as exc:
+        return await interaction.followup.send(str(exc), ephemeral=True)
+
+    guild = interaction.guild
+
+    def name_of(channel_id):
+        try:
+            found = guild.get_channel(int(channel_id)) if guild else None
+        except (TypeError, ValueError):
+            found = None
+        return getattr(found, "name", "") or ""
+
+    def owner_name_of(owner_id):
+        try:
+            member = guild.get_member(int(owner_id)) if guild else None
+        except (TypeError, ValueError):
+            member = None
+        return getattr(member, "display_name", None) or f"joueur …{str(owner_id)[-4:]}"
+
+    player_id = str(joueur.id) if joueur else None
+    closed = [r for r in fm_state().get("history", []) if player_id is None or r.get("owner") == player_id]
+    records = closed + live_records(name_of, player_id)
+    if not records:
+        return await interaction.followup.send(
+            "Aucune session enregistrée pour le moment. L'historique démarre avec la fermeture des sessions "
+            "(`/fmstop`, archivage) : il n'y a rien avant.", ephemeral=True)
+
+    report = build_report(records, tz, start, end, label, now,
+                          player_label=joueur.display_name if joueur else None)
+    page = render_report_html(report, owner_name_of)
+    p = report["period"]
+    summary = (f"**{label}** : {p['n']} session(s) · dépensé {format_number(p['total'])} · "
+               f"facturé {format_number(p['total'] + p['adjust'])} · payé {format_number(p['paid'])} kamas")
+    if p["n"] == 0:
+        summary = f"**{label}** : aucune session sur cette période (la page montre les autres périodes)."
+    if start is None:
+        slug = "toutes-les-donnees"
+    elif periode == "annee":
+        slug = f"{start.year}"
+    elif periode == "trimestre":
+        slug = f"{start.year}-t{(start.month - 1) // 3 + 1}"
+    else:
+        slug = f"{start.year}-{start.month:02d}"
+    await interaction.followup.send(
+        content=summary + "\nOuvre le fichier dans ton navigateur.",
+        file=discord.File(BytesIO(page.encode("utf-8")), filename=f"bilan-fm-{slug}.html"),
         ephemeral=True)
 
 @bot.tree.command(name="fmarchive", description="Archiver ce salon FM (fin de la FM de l'objet)")

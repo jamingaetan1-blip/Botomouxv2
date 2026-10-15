@@ -1836,16 +1836,8 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
                 owner = owner_name_of(r.get("owner")) if r.get("owner") else None
                 counts = r.get("attempts") or {}
                 tries = sum(counts.values())
-                money = [f"dépensé {format_number(r['total'])}"]
-                if r.get("adjust"):
-                    money.append(f"ajustement +{format_number(r['adjust'])}")
-                if r.get("paid"):
-                    money.append(f"acompte {format_number(r['paid'])}")
-                st = stock_of(r)
-                if st:   # suivi du stock : « stock 20 M → 5 M » (? = non renseigne)
-                    money.append("stock " + (_kamas_short(st["start"]) if st.get("start") is not None else "?")
-                                 + " → " + (_kamas_short(st["end"]) if st.get("end") is not None else "?"))
-                chips = ["".join(f'<span class="chip">{esc(m)}</span>' for m in money)]
+                # Carte epuree : le total a droite suffit. Ni depense, ni acompte, ni ajustement, ni stock (suivi du stock : carte de synthese).
+                chips = []
                 if tries:
                     chips.append('<span class="chip">' + esc("  ".join(
                         f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)) + "</span>")

@@ -8,6 +8,7 @@ from io import BytesIO
 import asyncio
 import base64
 import datetime
+import difflib
 import html as html_lib
 import math
 import shutil
@@ -41,6 +42,7 @@ TESS_LANG = "fra"
 # Double lecture de chaque capture (la meme image lue a deux echelles differentes). Une capture
 # n'est ajoutee automatiquement que si les DEUX lectures donnent exactement les memes lignes.
 # Mettre FM_DOUBLE_READ=0 pour la desactiver (non recommande : c'est un filet de securite).
+BOT_VERSION = "2026-10-15"   # affichee au demarrage et par !sync : permet de savoir quel code tourne vraiment
 DOUBLE_READ = os.environ.get("FM_DOUBLE_READ", "1") != "0"
 OCR_CONFIG = "--psm 6"
 # Echelles d'agrandissement des deux lectures (mesurees : la paire 3 + 4 est la plus fiable).
@@ -250,7 +252,9 @@ def normalize_ocr_line(raw):
     line = raw.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ")
     # Horodatage du chat ("[12:38]", crochets lus ou non) : on l'enleve, sinon ses crochets
     # seraient pris pour un objet et ses chiffres pour une quantite.
-    line = re.sub(r"\[?\s*\d{1,2}\s*:\s*\d{2}\s*\]?", " ", line)
+    # L'OCR lit parfois le crochet ouvrant comme « f », « l », « I » ou « | » et le fermant comme « ) » (vu sur de
+    # vraies captures : « f12:16) ») : on tolere ces confusions, mais seulement collees a une heure HH:MM.
+    line = re.sub(r"[\[\(\{fFIl|!]?\s*\d{1,2}\s*:\s*\d{2}\s*[\]\)\}|]?", " ", line)
     # Separateur de milliers lu "." ou "," (20.250 -> 20 250). Les kamas sont entiers :
     # un point suivi de 3 chiffres ne peut etre qu'un separateur de milliers.
     line = re.sub(r"(?<=\d)[.,](?=\d{3}(?!\d))", " ", line)
@@ -529,8 +533,8 @@ def aggregate_entries(entries):
         v["price"] += e["price"]
     return agg
 
-def commit_entries(session, channel_id, author, entries, hashes):
-    """SEUL endroit ou une capture modifie les totaux. Retourne le montant ajoute."""
+def commit_entries(session, channel_id, author, entries, hashes, ref=None, source="capture"):
+    """SEUL endroit ou une capture modifie les totaux. Retourne le montant ajoute. Garde de quoi l'annuler (/fmundo)."""
     added = sum(e["price"] for e in entries)
     session["total"] += added
     uid = str(author.id)
@@ -545,6 +549,10 @@ def commit_entries(session, channel_id, author, entries, hashes):
         if h and h not in seen:
             seen.append(h)
     del seen[:-200]
+    captures = session.setdefault("captures", [])
+    captures.append({"ref": str(ref) if ref is not None else None, "by": uid, "at": now_iso(), "src": source,
+                     "entries": [dict(e) for e in entries], "hashes": [h for h in hashes if h]})
+    del captures[:-CAPTURE_HISTORY_CAP]
     touch_channel(channel_id)
     save_data()
     return added
@@ -628,7 +636,7 @@ class CaptureConfirmView(discord.ui.View):
             await interaction.response.edit_message(
                 content="La session n'est plus active : rien n'a été ajouté.", view=None)
             return
-        added = commit_entries(session, channel_id, self.message.author, self.entries, self.hashes)
+        added = commit_entries(session, channel_id, self.message.author, self.entries, self.hashes, ref=self.message.id)
         await interaction.response.edit_message(
             content=capture_reply_text(self.message.author, self.entries, session), view=None)
         await send_capture_event(self.message, self.message.author, added, self.entries)
@@ -656,10 +664,25 @@ class CaptureConfirmView(discord.ui.View):
 def attempt_log():
     return fm_state().setdefault("attempt_log", [])
 
-def log_attempt(channel_id, key, user_id, at):
+def log_attempt(channel_id, key, user_id, at, rune=None, bulk=False):
+    """rune : rune visee au moment du clic ; bulk : ajoutee en bloc (/fmtenta), sans heure reelle."""
     log = attempt_log()
-    log.append({"t": at, "k": key, "c": str(channel_id), "u": str(user_id)})
+    entry = {"t": at, "k": key, "c": str(channel_id), "u": str(user_id)}
+    if rune:
+        entry["r"] = rune
+    if bulk:
+        entry["b"] = 1
+    log.append(entry)
     del log[:-ATTEMPT_LOG_CAP]
+
+def unlog_latest(channel_id, key):
+    """Retire du journal l'entree la plus recente d'une issue pour un salon (ajustement negatif)."""
+    log = attempt_log()
+    for i in range(len(log) - 1, -1, -1):
+        if log[i].get("c") == str(channel_id) and log[i].get("k") == key:
+            del log[i]
+            return True
+    return False
 
 def unlog_attempt(channel_id, key, at):
     """Retire du journal l'entree d'un clic annule (la plus recente qui correspond)."""
@@ -705,19 +728,21 @@ def compute_attempt_stats(entries, pause_seconds=ATTEMPT_PAUSE_SECONDS):
         except (KeyError, ValueError, TypeError):
             continue
         if e.get("k") in known:
-            rows.append((when, e["k"]))
+            rows.append((when, e["k"], bool(e.get("b"))))
     rows.sort(key=lambda r: r[0])
 
     n = len(rows)
     counts = {key: 0 for key in known}
-    for _, key in rows:
+    for _, key, _bulk in rows:
         counts[key] += 1
-    gaps = [(rows[i][0] - rows[i - 1][0]).total_seconds() for i in range(1, n)]
+    # Les tentatives ajoutees en bloc n'ont pas d'heure reelle : comptees partout, mais exclues du rythme.
+    timed = [r for r in rows if not r[2]]
+    gaps = [(timed[i][0] - timed[i - 1][0]).total_seconds() for i in range(1, len(timed))]
     active = [g for g in gaps if g <= pause_seconds]
     target = known[0]
 
     longest = current = 0
-    for _, key in rows:
+    for _, key, _bulk in rows:
         if key == target:
             current = 0
         else:
@@ -727,7 +752,7 @@ def compute_attempt_stats(entries, pause_seconds=ATTEMPT_PAUSE_SECONDS):
     avg_gap = sum(active) / len(active) if active else None
     per_target = n / counts[target] if counts[target] else None
     return {
-        "n": n, "counts": counts, "target": target,
+        "n": n, "counts": counts, "target": target, "bulk": n - len(timed),
         "first": rows[0][0] if rows else None, "last": rows[-1][0] if rows else None,
         "avg_gap": avg_gap, "pauses": len(gaps) - len(active), "active_seconds": sum(active),
         "per_target": per_target,
@@ -735,10 +760,27 @@ def compute_attempt_stats(entries, pause_seconds=ATTEMPT_PAUSE_SECONDS):
         "longest_without_target": longest, "current_without_target": current,
     }
 
+def stats_by_rune(entries):
+    """Tentatives regroupees par rune visee : [(nom, total, {issue: n})], de la plus essayee a la moins essayee.
+    Liste vide si aucune rune n'a jamais ete precisee (rien a afficher)."""
+    known = [key for key, *_ in FM_OUTCOMES]
+    groups, any_rune = {}, False
+    for e in entries:
+        if e.get("k") not in known:
+            continue
+        rune = e.get("r")
+        any_rune = any_rune or bool(rune)
+        group = groups.setdefault(rune or "", {k: 0 for k in known})
+        group[e["k"]] += 1
+    if not any_rune:
+        return []
+    rows = [(name or "(rune non précisée)", sum(c.values()), c) for name, c in groups.items()]
+    return sorted(rows, key=lambda row: -row[1])
+
 def _decimal_fr(x):
     return f"{x:.1f}".replace(".", ",")
 
-def stats_embed(stats, scope_label):
+def stats_embed(stats, scope_label, by_rune=None):
     n = stats["n"]
     description = f"**{n}** tentative(s) enregistrée(s)"
     if stats["first"]:
@@ -763,6 +805,8 @@ def stats_embed(stats, scope_label):
             rhythm += f"\n{stats['pauses']} pause(s) de plus de {ATTEMPT_PAUSE_SECONDS // 60} min ignorée(s)"
     else:
         rhythm = "Pas assez de tentatives pour estimer le rythme."
+    if stats.get("bulk"):
+        rhythm += f"\n{stats['bulk']} tentative(s) ajoutée(s) en bloc (/fmtenta) : comptées, mais exclues du rythme"
     embed.add_field(name="⏱️ Rythme", value=rhythm, inline=False)
 
     _key, label, emoji, _style = FM_OUTCOMES[0]
@@ -778,6 +822,11 @@ def stats_embed(stats, scope_label):
         value=(f"Plus longue série sans {label.lower()} : **{stats['longest_without_target']}**\n"
                f"En cours : {stats['current_without_target']}"),
         inline=False)
+    if by_rune:
+        _k, _l, t_emoji, _s = FM_OUTCOMES[0]
+        lines = [f"**{name}** : {n} tent. · {t_emoji} {c[FM_OUTCOMES[0][0]]} ({c[FM_OUTCOMES[0][0]] * 100 / n:.0f} %)"
+                 for name, n, c in by_rune[:6]]
+        embed.add_field(name="🎯 Par rune visée", value=_cut("\n".join(lines)), inline=False)
     embed.set_footer(text="Fourchette = intervalle de confiance à 95 %. Chiffres observés sur tes "
                           "tentatives, pas les probabilités réelles du jeu.")
     return embed
@@ -799,6 +848,7 @@ def build_session_record(channel_id, name, owner, session, end, why):
         "total": session["total"], "adjust": charged, "paid": received,
         "items": {n: [v.get("qty", 0), v.get("price", 0)] for n, v in items[:SESSION_HISTORY_ITEMS]},
         "attempts": dict(attempts_of(session)["counts"]), "why": why,
+        "payments": [{k: v for k, v in p.items() if k in ("amount", "note", "at")} for p in payments_of(session)][-30:],
     }
 
 def record_session_history(channel, session, why):
@@ -1685,7 +1735,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 (f"{agg['target']} ({rate(agg)})" if agg["tries"] else "—", rate_value)]
 
     agg_heads = [("Sessions", "num", ""), ("Dépensé", "num", ""), ("Stock ajouté", "num", ""), ("Facturé", "num", ""),
-                 ("Payé", "num", ""), ("Tentatives", "num", ""), (target_label, "num", "Tri sur le taux de réussite")]
+                 ("Acomptes", "num", "Paiements enregistrés avec /fmpay pendant la session"), ("Tentatives", "num", ""), (target_label, "num", "Tri sur le taux de réussite")]
 
     def sortable_table(head_specs, rows):
         """head_specs : [(libelle, num|text|none, infobulle)] ; rows : [(cellules[(html, valeur)], en_surbrillance)]."""
@@ -1714,7 +1764,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
              ("Dépensé", amount(period["total"]), "kamas, achats"),
              ("Stock ajouté", amount(period["adjust"]), "kamas, ajustements"),
              ("Facturé", amount(period["total"] + period["adjust"]), "kamas, dépensé + stock"),
-             ("Payé", amount(period["paid"]), "kamas, enregistré"),
+             ("Acomptes", amount(period["paid"]), "kamas, versés en cours de session"),
              ("Tentatives", str(period["tries"]), f"{target_emoji} {period['target']} · {rate(period)}")]
     parts.append('<div class="kpis">' + "".join(
         f'<div class="kpi"><span class="lab">{esc(t)}</span><b>{v}</b><small>{esc(sub)}</small></div>' for t, v, sub in cards) + "</div>")
@@ -1746,7 +1796,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 if r.get("adjust"):
                     money.append(f"stock +{format_number(r['adjust'])}")
                 if r.get("paid"):
-                    money.append(f"payé {format_number(r['paid'])}")
+                    money.append(f"acompte {format_number(r['paid'])}")
                 chips = ["".join(f'<span class="chip">{esc(m)}</span>' for m in money)]
                 if tries:
                     chips.append('<span class="chip">' + esc("  ".join(
@@ -1872,8 +1922,8 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
     first = report["first"].strftime("%d/%m/%Y") if report["first"] else "—"
     notes = [f"Données enregistrées depuis le {first} : les sessions fermées avant la mise en place de l'historique n'y figurent pas.",
              "Une session compte à la date de sa fermeture (à la date de son début si elle est en cours).",
-             "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Payé = paiements enregistrés "
-             "pendant la session : un règlement fait après la fermeture n'est pas connu du bot.",
+             "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Acomptes = paiements enregistrés "
+             "avec /fmpay pendant la session ; le règlement final du client n'est pas enregistré dans le bot.",
              f"Mois, trimestres et années sont lus en heure de {esc(str(tz))}."]
     if (item_icons or any(r["icon"] for r in (runes or {}).get("rows", []))):
         if report["sample"]:
@@ -1899,12 +1949,363 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
             f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}</style></head><body><main>"
             + "".join(parts) + f"</main><script>{REPORT_JS}</script></body></html>")
 
+# ---------------- CORRECTIONS DE SESSION : /fmreset confirme, /fmundo, /fmadd ---------------- #
+CAPTURE_HISTORY_CAP = 40   # captures annulables par session (les plus recentes)
+
+async def perform_reset(interaction, channel_id):
+    """Remet la session a zero (le journal des statistiques est conserve) et previent le site et le panneau."""
+    sessions[channel_id] = empty_session()
+    touch_channel(channel_id)
+    save_data()
+    await send_event(site_event("session-reset", interaction.id, interaction.channel, interaction.created_at))
+    await sync_attempt_panel(interaction.channel, sessions[channel_id])
+
+class ResetConfirmView(discord.ui.View):
+    """Confirmation avant d'effacer une session : rien n'est supprime sans un clic explicite."""
+    def __init__(self, user_id, channel_id):
+        super().__init__(timeout=60)
+        self.user_id, self.channel_id = user_id, channel_id
+        self.done = False
+        self.reply_message = None
+
+    async def _allowed(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Seul l'auteur de la commande peut confirmer ou annuler.", ephemeral=True)
+            return False
+        if self.done:
+            await interaction.response.send_message("Déjà traité.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Oui, tout effacer", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        self.done = True
+        self.stop()
+        await perform_reset(interaction, self.channel_id)
+        await interaction.response.edit_message(content="Session réinitialisée !", view=None)
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._allowed(interaction):
+            return
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content="Remise à zéro annulée : rien n'a été effacé.", view=None)
+
+    async def on_timeout(self):
+        if not self.done and self.reply_message is not None:
+            try:
+                await self.reply_message.edit(content="⌛ Confirmation expirée : rien n'a été effacé.", view=None)
+            except discord.HTTPException:
+                pass
+
+def undo_last_capture(session):
+    """Retire de la session la derniere capture (ou ligne ajoutee a la main). Retourne la capture retiree, ou None."""
+    captures = session.get("captures") or []
+    if not captures:
+        return None
+    last = captures.pop()
+    entries = last.get("entries") or []
+    added = sum(e["price"] for e in entries)
+    session["total"] = max(0, session["total"] - added)
+    users = session.get("users") or {}
+    uid = last.get("by")
+    if uid in users:
+        users[uid] -= added
+        if users[uid] <= 0:
+            users.pop(uid, None)
+    runes = session.get("runes") or {}
+    for name, vals in aggregate_entries(entries).items():
+        slot = runes.get(name)
+        if slot is None:
+            continue
+        slot["qty"] -= vals["qty"]
+        slot["price"] -= vals["price"]
+        if slot["qty"] <= 0 and slot["price"] <= 0:
+            runes.pop(name, None)
+    seen = session.get("seen") or []
+    for h in last.get("hashes") or []:   # l'image peut etre renvoyee : elle ne sera plus vue comme un doublon
+        if h in seen:
+            seen.remove(h)
+    return last
+
+ADD_LINE_A = re.compile(r"^\s*\[?\s*(.+?)\s*\]?\s+[xX\u00d7]\s*(\d{1,7})\s+(\S.*?)\s*$")   # Rune Ga Pa x100 2M45
+ADD_LINE_B = re.compile(r"^\s*(\d{1,7})\s*[xX\u00d7]\s+(\S.*?)\s*$")   # 100 x Rune Ga Pa 2M45
+ADD_HELP = "Format : `/fmadd ligne:Rune Ga Pa x100 2M45` (objet, `x` quantité, montant TOTAL de la ligne : 2M45, 2 450 000, 2.45M…)."
+
+def _split_name_and_price(text):
+    """Separe « Rune Ga Pa 2 450 000 » en (nom, prix) : le prix est le PLUS LONG montant valide en fin de ligne."""
+    tokens = text.split()
+    for cut in range(1, len(tokens)):
+        price = parse_kamas_amount(" ".join(tokens[cut:]))
+        if price is not None:
+            return " ".join(tokens[:cut]), price
+    return None
+
+def parse_add_line(text):
+    """(nom, quantite, prix total) d'une ligne saisie a la main. Leve ValueError avec un message pret a afficher."""
+    m = ADD_LINE_A.match(text or "")
+    if m:
+        name, qty, price_text = m.group(1), int(m.group(2)), m.group(3)
+        price = parse_kamas_amount(price_text)
+        if price is None:
+            raise ValueError(f"Montant non compris : « {price_text} ». {ADD_HELP}")
+    else:
+        m = ADD_LINE_B.match(text or "")
+        if not m:
+            raise ValueError(f"Ligne non comprise : « {text} ». {ADD_HELP}")
+        qty = int(m.group(1))
+        split = _split_name_and_price(m.group(2))
+        if split is None:
+            raise ValueError(f"Montant non compris dans « {m.group(2)} ». {ADD_HELP}")
+        name, price = split
+    name = re.sub(r"\s+", " ", name).strip(" []")
+    if not name or len(name) > 60:
+        raise ValueError(f"Nom d'objet absent ou trop long. {ADD_HELP}")
+    if qty < 1:
+        raise ValueError(f"La quantité doit être au moins 1. {ADD_HELP}")
+    return name, qty, price
+
+def resolve_added_name(session, name):
+    """
+    Nom d'objet a retenir pour un ajout manuel : (nom, avertissement, refus). Un nom deja vu dans la session ou connu
+    de DofusDB reprend son orthographe officielle (les lignes se regroupent) ; une rune inconnue mais proche d'une
+    rune connue est REFUSEE avec des suggestions plutot que d'ajouter une ligne a part.
+    """
+    key = rune_key(name)
+    for known in (session.get("runes") or {}):
+        if rune_key(known) == key:
+            return known, None, None
+    catalog = fm_state().get("rune_catalog") or {}
+    if key in catalog:
+        return catalog[key]["name"], None, None
+    if not key.startswith("rune"):
+        return name, None, None   # ressource ou autre objet : la liste de DofusDB ne couvre que les runes
+    if not catalog:
+        return name, "liste des runes de DofusDB indisponible : nom non vérifié", None
+    close = difflib.get_close_matches(key, list(catalog), n=3, cutoff=0.7)
+    if close:
+        suggestions = " ou ".join(f"« {catalog[c]['name']} »" for c in close)
+        return None, None, f"Rune inconnue : « {name} ». Tu voulais dire {suggestions} ? Relance avec le nom exact."
+    return name, "nom inconnu de DofusDB : ajouté tel quel, vérifie l'orthographe", None
+
+# ---------------- RUNE VISEE ET AJUSTEMENT DES TENTATIVES ---------------- #
+ATTEMPT_DELTA_MAX = 500
+DELTA_RE = re.compile(r"^\s*([+\-\u2212\u2013])?\s*(\d{1,4})\s*$")
+
+def parse_attempt_delta(text):
+    """« +20 », « -3 », « 20 » -> entier non nul (|n| <= 500). Leve ValueError avec un message pret a afficher."""
+    m = DELTA_RE.match(text or "")
+    if not m:
+        raise ValueError(f"Nombre non compris : « {text} ». Exemples : `+20`, `-3`, `20` (le + est facultatif).")
+    value = int(m.group(2)) * (-1 if m.group(1) in ("-", "\u2212", "\u2013") else 1)
+    if value == 0:
+        raise ValueError("Le nombre doit être différent de zéro.")
+    if abs(value) > ATTEMPT_DELTA_MAX:
+        raise ValueError(f"Maximum {ATTEMPT_DELTA_MAX} tentatives à la fois (pour éviter une faute de frappe).")
+    return value
+
+def adjust_attempts(session, channel_id, user_id, key, delta, at):
+    """
+    Ajoute (delta > 0) ou retire (delta < 0) des tentatives d'une issue. Retourne le nombre REELLEMENT applique
+    (signe conserve) : un retrait ne descend jamais sous zero. Les ajouts sont marques « en bloc » : comptes
+    partout, mais sans heure reelle, donc exclus du calcul du rythme.
+    """
+    attempts = attempts_of(session)
+    counts = attempts["counts"]
+    if delta > 0:
+        rune = attempts.get("target")
+        counts[key] = counts.get(key, 0) + delta
+        for _ in range(delta):
+            attempts["history"].append({"k": key, "at": at, "by": str(user_id), "b": 1, **({"r": rune} if rune else {})})
+            log_attempt(channel_id, key, user_id, at, rune=rune, bulk=True)
+        del attempts["history"][:-ATTEMPT_HISTORY_CAP]
+        return delta
+    applied = 0
+    for _ in range(-delta):
+        if counts.get(key, 0) <= 0:
+            break
+        counts[key] -= 1
+        for i in range(len(attempts["history"]) - 1, -1, -1):
+            if attempts["history"][i].get("k") == key:
+                del attempts["history"][i]
+                break
+        unlog_latest(channel_id, key)
+        applied -= 1
+    return applied
+
+def attempts_summary_line(session):
+    counts = attempts_of(session)["counts"]
+    detail = " · ".join(f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)
+    return f"total {attempts_total(session)} ({detail})"
+
+def rune_autocomplete_choices(session, current, limit=25):
+    """Runes deja achetees dans la session, puis runes connues de DofusDB, contenant le texte saisi."""
+    needle = rune_key(current)
+    names, seen = [], set()
+    for name in sorted((session or {}).get("runes") or {}):
+        if needle in rune_key(name) and rune_key(name) not in seen:
+            names.append(name); seen.add(rune_key(name))
+    catalog = fm_state().get("rune_catalog") or {}
+    for key in sorted(catalog):
+        if needle in key and key not in seen:
+            names.append(catalog[key]["name"]); seen.add(key)
+    return names[:limit]
+
+# ---------------- RECAPITULATIF CLIENT : /fmrecap ---------------- #
+# Une page imprimable pour UNE commande, a transmettre au client : achats detailles, stock apporte, acomptes et
+# MONTANT A REGLER. Garantie d'exactitude : les lignes affichees additionnent toujours au total (un ecart eventuel
+# devient une ligne explicite), et chaque decompte additionne aux totaux enregistres.
+RECAP_CSS = """
+:root{color-scheme:light}
+*{box-sizing:border-box}
+body{margin:0;background:#f3f4f8;color:#1d2333;font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.sheet{max-width:820px;margin:24px auto;background:#fff;padding:36px 42px;border:1px solid #e3e6ee;border-radius:12px}
+h1{font-size:1.6rem;margin:0}
+h2{font-size:1.05rem;margin:30px 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#667085}
+.ref{color:#667085;margin:2px 0 0}
+.banner{background:#fff7e6;border:1px solid #f0c36d;border-radius:10px;padding:9px 14px;margin:16px 0 0}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 28px;margin:20px 0 4px}
+.meta div{border-bottom:1px solid #eceef4;padding-bottom:6px}
+.meta span{display:block;color:#667085;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
+.meta b{font-weight:650}
+.itemcard{display:flex;gap:16px;align-items:center;border:1px solid #e3e6ee;border-radius:12px;padding:12px 16px;margin:18px 0 0}
+.tile{flex:none;display:flex;align-items:center;justify-content:center;width:80px;height:80px;background:#f6f7fb;border:1px solid #e3e6ee;border-radius:14px}
+.tile img{width:64px;height:64px;object-fit:contain}
+.itemcard strong{font-size:1.15rem;display:block}
+.itemcard small{color:#667085}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 6px;border-bottom:1px solid #eceef4;text-align:left;vertical-align:middle}
+th{color:#667085;font-size:.76rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.r{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.rname{display:flex;align-items:center;gap:10px}
+.ico{width:32px;height:32px;object-fit:contain;flex:none}
+.ph{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px dashed #cfd3de;border-radius:8px;color:#98a2b3;font-size:.8rem;flex:none}
+tr.sub td{font-weight:650;border-bottom:2px solid #1d2333}
+.plus{color:#12805c}
+.moins{color:#b54708}
+.grand td{font-size:1.3rem;font-weight:800;border-top:2px solid #1d2333;border-bottom:0;padding-top:12px}
+.attempts{display:flex;gap:10px;flex-wrap:wrap}
+.attempts span{border:1px solid #e3e6ee;border-radius:10px;padding:6px 12px;background:#f6f7fb}
+.foot{margin-top:30px;color:#667085;font-size:.82rem;border-top:1px solid #eceef4;padding-top:10px}
+@page{size:A4;margin:16mm}
+.keep{break-inside:avoid}
+h2{break-after:avoid}
+@media print{body{background:#fff;font-size:12px;line-height:1.35}.sheet{margin:0;border:0;border-radius:0;padding:0;max-width:none}
+tr,.itemcard,.keep{break-inside:avoid}h1{font-size:1.3rem}h2{margin:14px 0 4px}.banner{margin-top:8px;padding:5px 12px}
+.meta{margin:10px 0 0;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.itemcard{margin-top:10px;padding:6px 12px}
+.tile{width:56px;height:56px}.tile img{width:46px;height:46px}th,td{padding:3px 6px}.ico,.ph{width:22px;height:22px}
+.grand td{font-size:1.1rem;padding-top:6px}.foot{margin-top:12px}}
+@media (max-width:560px){.sheet{margin:0;border-radius:0;padding:22px 16px}.avg{display:none}th{white-space:normal}}
+@media (max-width:400px){.sheet{padding:18px 12px}.grand td{font-size:1.05rem}h1{font-size:1.35rem}}
+"""
+
+def build_recap(record, tz, now, forgemage, client="", item=None, show_attempts=False, provisional=False, sample=False):
+    """Toutes les donnees du recapitulatif, calculees a partir d'un enregistrement de session (terminee ou en cours)."""
+    items = record.get("items") or {}
+    lines = [{"name": n, "qty": q, "price": p} for n, (q, p) in sorted(items.items(), key=lambda kv: -kv[1][1])]
+    total = record["total"]
+    other = total - sum(line["price"] for line in lines)   # achats non detailles (au-dela des 40 objets gardes, anciennes sessions)
+    adjust_total, paid_total = record.get("adjust", 0), record.get("paid", 0)
+    payments = record.get("payments")
+    if payments is None:   # session fermee avant l'enregistrement du detail : on ne connait que les totaux
+        adjustments = [{"amount": adjust_total, "note": "Stock apporté / ajustements", "at": None}] if adjust_total else []
+        deposits = [{"amount": paid_total, "note": "Acomptes versés", "at": None}] if paid_total else []
+    else:
+        adjustments = [{"amount": -p["amount"], "note": p.get("note") or "", "at": p.get("at")} for p in payments if p["amount"] < 0]
+        deposits = [{"amount": p["amount"], "note": p.get("note") or "", "at": p.get("at")} for p in payments if p["amount"] > 0]
+        for rows, expected, label in ((adjustments, adjust_total, "Autres ajustements"), (deposits, paid_total, "Autres acomptes")):
+            gap = expected - sum(r["amount"] for r in rows)   # detail tronque : la difference reste visible
+            if gap:
+                rows.append({"amount": gap, "note": label, "at": None})
+    return {
+        "forgemage": forgemage, "client": client.strip(), "reference": record.get("name") or "", "when": record_when(record, tz) or now,
+        "now": now, "tz": tz, "item": item, "lines": lines, "other": other, "total": total,
+        "adjustments": adjustments, "deposits": deposits, "due": total + adjust_total - paid_total,
+        "attempts": record.get("attempts") if show_attempts else None, "provisional": provisional, "sample": sample,
+    }
+
+def render_recap_html(recap, icons=None, item_icon=None):
+    esc = html_lib.escape
+    icons = icons or {}
+    def amt(n):
+        return f'<span class="n">{format_number(n)}</span> kamas'
+    when = recap["when"]
+    date_text = f"{when.day} {MONTHS_FR[when.month - 1]} {when.year}"
+
+    head = [f"<h1>Récapitulatif de commande</h1><p class=\"ref\">Référence : {esc(recap['reference'] or '—')}</p>"]
+    if recap["sample"]:
+        head.append('<div class="banner"><b>Exemple</b> : données et icônes fictives, pour illustrer le rendu.</div>')
+    if recap["provisional"]:
+        head.append('<div class="banner"><b>Montants provisoires</b> : la session est encore en cours, '
+                    'ce document sera mis à jour à sa clôture.</div>')
+    meta = [("Forgemage", recap["forgemage"] or "—"), ("Date", date_text)]
+    if recap["client"]:
+        meta.insert(0, ("Client", recap["client"]))
+    head.append('<div class="meta">' + "".join(f"<div><span>{esc(k)}</span><b>{esc(v)}</b></div>" for k, v in meta) + "</div>")
+
+    body = []
+    item = recap["item"]
+    if item:
+        pic = (f'<div class="tile"><img src="{item_icon}" alt="" width="64" height="64"></div>' if item_icon else "")
+        detail = " · ".join(x for x in (f"niveau {item['level']}" if item.get("level") else None, item.get("type_name")) if x)
+        body.append(f'<div class="itemcard">{pic}<div><small>Équipement forgé</small><strong>{esc(item["name"])}</strong>'
+                    f'<small>{esc(detail)}</small></div></div>')
+
+    rows = []
+    for line in recap["lines"]:
+        icon = icons.get(rune_key(line["name"]))
+        pic = f'<img class="ico" alt="" src="{icon}" width="32" height="32">' if icon else ""
+        avg = int((Decimal(line["price"]) / Decimal(line["qty"])).quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if line["qty"] else 0
+        rows.append(f'<tr><td><span class="rname">{pic}<span>{esc(line["name"])}</span></span></td>'
+                    f'<td class="r">{format_number(line["qty"])}</td><td class="r avg">{format_number(avg)}</td>'
+                    f'<td class="r">{format_number(line["price"])}</td></tr>')
+    if recap["other"]:
+        label = "Autres achats" if recap["other"] > 0 else "Correction"
+        rows.append(f'<tr><td>{label}</td><td class="r"></td><td class="r avg"></td><td class="r">{format_number(recap["other"])}</td></tr>')
+    rows.append(f'<tr class="sub"><td colspan="2">Total des achats</td><td class="r avg"></td><td class="r">{format_number(recap["total"])}</td></tr>')
+    body.append("<h2>Détail des achats</h2><table><thead><tr><th>Objet</th><th class=\"r\">Quantité</th>"
+                "<th class=\"r avg\">Prix moyen / unité</th><th class=\"r\">Montant</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+
+    settle = [f'<tr><td>Total des achats</td><td class="r">{amt(recap["total"])}</td></tr>']
+    for a in recap["adjustments"]:
+        note = f" · {esc(a['note'])}" if a["note"] else ""
+        settle.append(f'<tr><td class="plus">Stock apporté{note}</td><td class="r plus">+ {amt(a["amount"])}</td></tr>')
+    for d in recap["deposits"]:
+        note = f" · {esc(d['note'])}" if d["note"] else ""
+        try:
+            day = datetime.datetime.fromisoformat(d["at"]).astimezone(recap["tz"]).strftime("%d/%m/%Y") if d["at"] else None
+        except (ValueError, TypeError):
+            day = None
+        when_txt = f" du {day}" if day else ""
+        settle.append(f'<tr><td class="moins">Acompte{when_txt}{note}</td><td class="r moins">− {amt(d["amount"])}</td></tr>')
+    due = recap["due"]
+    if due >= 0:
+        settle.append(f'<tr class="grand"><td>Montant à régler</td><td class="r">{amt(due)}</td></tr>')
+    else:
+        settle.append(f'<tr class="grand"><td>Trop-perçu (en votre faveur)</td><td class="r">{amt(-due)}</td></tr>')
+    body.append("<section class=\"keep\"><h2>Décompte</h2><table><tbody>" + "".join(settle) + "</tbody></table></section>")
+
+    if recap["attempts"]:
+        counts = recap["attempts"]
+        chips = "".join(f"<span>{emoji} {esc(label)} : <b>{counts.get(key, 0)}</b></span>" for key, label, emoji, _st in FM_OUTCOMES)
+        body.append(f"<section class=\"keep\"><h2>Déroulé de la forgemagie</h2><div class=\"attempts\"><span>Tentatives : <b>{sum(counts.values())}</b></span>{chips}</div></section>")
+
+    foot = (f'<div class="foot">Document généré le {recap["now"].strftime("%d/%m/%Y à %H:%M")} · montants exprimés en kamas.</div>')
+    return ("<!DOCTYPE html>\n<html lang=\"fr\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">"
+            f"<title>Récapitulatif · {esc(recap['reference'])}</title><style>{RECAP_CSS}</style></head><body><main class=\"sheet\">"
+            + "".join(head) + "".join(body) + foot + "</main></body></html>")
+
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
 # Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
 # dans la session (data.json) ; l'identifiant du message du panneau est range a part, dans l'etat
 # FM, pour survivre a /fmreset et /fmstart.
 def new_attempts():
-    return {"counts": {key: 0 for key, *_ in FM_OUTCOMES}, "history": []}
+    return {"counts": {key: 0 for key, *_ in FM_OUTCOMES}, "history": [], "target": None}
 
 def attempts_of(session):
     # Les sessions creees avant cette fonctionnalite n'ont pas la cle : on la cree a la volee.
@@ -1913,6 +2314,7 @@ def attempts_of(session):
     for key, *_ in FM_OUTCOMES:
         counts.setdefault(key, 0)
     attempts.setdefault("history", [])
+    attempts.setdefault("target", None)
     return attempts
 
 def attempts_total(session):
@@ -1940,6 +2342,9 @@ def attempts_embed(session, closed=False):
         n = counts.get(key, 0)
         share = f" ({n * 100 / total:.0f} %)" if total else ""
         embed.add_field(name=f"{emoji} {label}", value=f"**{n}**{share}", inline=True)
+    target = attempts_of(session).get("target")
+    if target:
+        embed.add_field(name="🎯 Rune visée", value=f"**{target}**", inline=False)
     return embed
 
 def panels():
@@ -2078,9 +2483,10 @@ class AttemptPanelView(discord.ui.View):
         attempts = attempts_of(session)
         attempts["counts"][key] = attempts["counts"].get(key, 0) + 1
         at = now_iso()
-        attempts["history"].append({"k": key, "at": at, "by": str(interaction.user.id)})
+        target = attempts.get("target")
+        attempts["history"].append({"k": key, "at": at, "by": str(interaction.user.id), **({"r": target} if target else {})})
         del attempts["history"][:-ATTEMPT_HISTORY_CAP]
-        log_attempt(interaction.channel.id, key, interaction.user.id, at)
+        log_attempt(interaction.channel.id, key, interaction.user.id, at, rune=target)
         touch_channel(interaction.channel.id)
         save_data()
         await interaction.response.edit_message(embed=attempts_embed(session))
@@ -2526,6 +2932,9 @@ def channel_welcome_embed():
             "`/fmhistorique` · ton historique et tes records (ou ceux d'un autre joueur)\n"
             "`/fmbilan` · page de bilan : chronologie et totaux par mois, trimestre, année\n"
             "`/fmitem` · associer l'équipement forgé à ce salon (son icône apparaît dans le bilan)\n"
+            "`/fmundo` · annuler la dernière capture · `/fmadd` · ajouter une ligne à la main\n"
+            "`/fmrune` · rune visée · `/fmtenta` · ajuster les tentatives (+20, -1)\n"
+            "`/fmrecap` · récapitulatif de la commande à envoyer au client\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -2583,6 +2992,11 @@ async def ensure_welcome_message(guild):
 @bot.tree.command(name="fmstart", description="Demarrer une session FM")
 async def fmstart(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
+    existing = sessions.get(channel_id)
+    if existing is not None:   # jamais d'ecrasement silencieux d'une session en cours
+        return await interaction.response.send_message(
+            f"Une session est déjà en cours dans ce salon ({format_number(existing['total'])} kamas). "
+            "`/fmstop` pour la clôturer, ou `/fmreset` pour la remettre à zéro.", ephemeral=True)
     sessions[channel_id] = empty_session()
     touch_channel(channel_id)
     save_data()
@@ -2622,12 +3036,20 @@ async def fmstop(interaction: discord.Interaction):
 @bot.tree.command(name="fmreset", description="Reinitialiser la session")
 async def fmreset(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
-    sessions[channel_id] = empty_session()
-    touch_channel(channel_id)
-    save_data()
-    await interaction.response.send_message("Session reinitialisee !")
-    await send_event(site_event("session-reset", interaction.id, interaction.channel, interaction.created_at))
-    await sync_attempt_panel(interaction.channel, sessions[channel_id])
+    session = sessions.get(channel_id)
+    if session is None or not session_has_activity(session):   # rien a perdre : pas de confirmation
+        await perform_reset(interaction, channel_id)
+        return await interaction.response.send_message("Session reinitialisee !")
+
+    lines = sum(1 for _ in (session.get("runes") or {}))
+    paiements = len(payments_of(session))
+    text = (f"⚠️ **Remettre la session à zéro ?**\n"
+            f"Seront effacés : **{format_number(session['total'])} kamas** d'achats, {lines} objet(s), "
+            f"{paiements} paiement(s) ou ajustement(s), {attempts_total(session)} tentative(s) du panneau.\n"
+            "**Action irréversible.** Les statistiques déjà enregistrées (`/fmstats`) ne sont pas touchées.")
+    view = ResetConfirmView(interaction.user.id, channel_id)
+    await interaction.response.send_message(text, view=view)
+    view.reply_message = await interaction.original_response()
 
 @bot.tree.command(name="fmtotal", description="Voir le total actuel")
 async def fmtotal(interaction: discord.Interaction):
@@ -2711,6 +3133,134 @@ async def fmunpay(interaction: discord.Interaction):
         f"**Reste à payer : {format_number(amount_due(session))} kamas**"
     )
 
+@bot.tree.command(name="fmundo", description="Annuler la dernière capture validée (ou la dernière ligne ajoutée à la main)")
+async def fmundo(interaction: discord.Interaction):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    if not can_tag_channel(interaction.user, channel_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut annuler une capture.", ephemeral=True)
+    last = undo_last_capture(session)
+    if last is None:
+        return await interaction.response.send_message(
+            "Rien à annuler : seules les captures validées avec cette version sont annulables.", ephemeral=True)
+    touch_channel(channel_id)
+    save_data()
+
+    entries = last.get("entries") or []
+    removed = sum(e["price"] for e in entries)
+    origin = "ajout manuel" if last.get("src") == "manual" else "capture"
+    lines = "\n".join(f"{name} x{v['qty']} {format_number(v['price'])} Kamas" for name, v in aggregate_entries(entries).items())
+    text = (f"↩️ Annulé ({origin} de <@{last.get('by')}>) : **-{format_number(removed)} kamas**, {len(entries)} ligne(s)\n{lines}\n\n"
+            f"Total global : {format_number(session['total'])}")
+    if payments_of(session):
+        text += f"\nReste à payer : {format_number(amount_due(session))}"
+    remaining = len(session.get("captures") or [])
+    text += f"\n({remaining} annulation(s) encore possible(s). Le site n'est pas prévenu de l'annulation.)"
+    await interaction.response.send_message(text[:1990])
+
+@bot.tree.command(name="fmadd", description="Ajouter à la main un achat que la capture n'a pas pu lire")
+@app_commands.describe(ligne="Objet, quantité, montant TOTAL de la ligne. Ex : Rune Ga Pa x100 2M45")
+async def fmadd(interaction: discord.Interaction, ligne: str):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    if not can_tag_channel(interaction.user, channel_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut ajouter une ligne.", ephemeral=True)
+    try:
+        name, qty, price = parse_add_line(ligne)
+    except ValueError as exc:
+        return await interaction.response.send_message(str(exc), ephemeral=True)
+    name, warning, refusal = resolve_added_name(session, name)
+    if refusal:
+        return await interaction.response.send_message(refusal, ephemeral=True)
+
+    entry = {"name": name, "qty": qty, "price": price}
+    added = commit_entries(session, channel_id, interaction.user, [entry], [], ref=interaction.id, source="manual")
+    average = int((Decimal(price) / Decimal(qty)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    text = (f"✍️ Ajout manuel : **{name} x{qty}** · {format_number(price)} kamas ({format_number(average)} / unité)\n"
+            f"Total global : {format_number(session['total'])}")
+    if payments_of(session):
+        text += f"\nReste à payer : {format_number(amount_due(session))}"
+    if warning:
+        text += f"\n⚠️ {warning}"
+    text += "\n`/fmundo` pour annuler."
+    await interaction.response.send_message(text)
+    await send_capture_event(interaction, interaction.user, added, [entry])
+
+@bot.tree.command(name="fmrune", description="Choisir la rune visée : les tentatives suivantes lui seront rattachées")
+@app_commands.describe(rune="Nom de la rune (ou « aucune » pour effacer le choix)")
+async def fmrune(interaction: discord.Interaction, rune: str):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    if not can_tag_channel(interaction.user, channel_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut choisir la rune visée.", ephemeral=True)
+    attempts = attempts_of(session)
+    if item_key(rune) in ITEM_REMOVE_WORDS:
+        attempts["target"] = None
+        save_data()
+        await refresh_attempt_panel(interaction.channel, session)
+        return await interaction.response.send_message("Plus de rune visée : les prochaines tentatives ne seront rattachées à aucune rune.")
+    name, warning, refusal = resolve_added_name(session, rune.strip())
+    if refusal:
+        return await interaction.response.send_message(refusal, ephemeral=True)
+    attempts["target"] = name
+    touch_channel(channel_id)
+    save_data()
+    await refresh_attempt_panel(interaction.channel, session)
+    text = f"🎯 Rune visée : **{name}**. Les prochaines tentatives (panneau ou `/fmtenta`) lui seront rattachées."
+    if warning:
+        text += f"\n⚠️ {warning}"
+    await interaction.response.send_message(text)
+
+@fmrune.autocomplete("rune")
+async def fmrune_autocomplete(interaction: discord.Interaction, current: str):
+    session = sessions.get(str(interaction.channel.id))
+    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in rune_autocomplete_choices(session, current)]
+
+@bot.tree.command(name="fmtenta", description="Ajuster les tentatives : +20 en ajoute 20, -1 en retire une")
+@app_commands.describe(nombre="+20, -3… (le + est facultatif, 500 au maximum)", issue="Issue concernée (par défaut : échec)")
+@app_commands.choices(issue=[app_commands.Choice(name=label, value=key) for key, label, *_ in FM_OUTCOMES])
+async def fmtenta(interaction: discord.Interaction, nombre: str, issue: str = None):
+    channel_id = str(interaction.channel.id)
+    session = sessions.get(channel_id)
+    if session is None:
+        return await interaction.response.send_message("Aucune session active.")
+    if not can_tag_channel(interaction.user, channel_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut ajuster les tentatives.", ephemeral=True)
+    try:
+        delta = parse_attempt_delta(nombre)
+    except ValueError as exc:
+        return await interaction.response.send_message(str(exc), ephemeral=True)
+    known = {key: (label, emoji) for key, label, emoji, _style in FM_OUTCOMES}
+    key = issue if issue in known else FM_OUTCOMES[-1][0]
+    label, emoji = known[key]
+
+    applied = adjust_attempts(session, channel_id, interaction.user.id, key, delta, now_iso())
+    touch_channel(channel_id)
+    save_data()
+    await refresh_attempt_panel(interaction.channel, session)
+    if applied == 0:
+        return await interaction.response.send_message(f"Rien à retirer : aucune tentative « {label} » enregistrée.", ephemeral=True)
+    sign = "+" if applied > 0 else "-"
+    text = f"{emoji} **{sign}{abs(applied)}** tentative(s) « {label} » · {attempts_summary_line(session)}"
+    if applied != delta:
+        text += f"\n⚠️ Seulement {abs(applied)} retirée(s) sur {abs(delta)} demandée(s) : il n'y en avait pas plus."
+    target = attempts_of(session).get("target")
+    if target and applied > 0:
+        text += f"\n🎯 Rattachées à : {target}"
+    if applied > 0:
+        text += "\nAjoutées en bloc : comptées, mais sans effet sur le calcul du rythme."
+    await interaction.response.send_message(text)
+
 @bot.tree.command(name="fmpanel", description="Poster (ou recréer) le panneau de suivi des tentatives")
 async def fmpanel(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
@@ -2757,7 +3307,8 @@ async def fmstats(interaction: discord.Interaction, portee: str = "salon"):
         return await interaction.response.send_message(
             "Aucune tentative enregistrée pour le moment. Elles sont comptées à chaque clic sur le "
             "panneau de suivi.", ephemeral=True)
-    await interaction.response.send_message(embed=stats_embed(compute_attempt_stats(entries), label))
+    await interaction.response.send_message(
+        embed=stats_embed(compute_attempt_stats(entries), label, stats_by_rune(entries)))
 
 @bot.tree.command(name="fmhistorique", description="Historique et records d'un joueur : ses FM, ses commandes, ses séries")
 @app_commands.describe(joueur="Le joueur (toi par défaut)")
@@ -2856,6 +3407,69 @@ async def fmitem(interaction: discord.Interaction, objet: str, salon: discord.Te
 async def fmitem_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=label[:100], value=value[:100]) for label, value in item_autocomplete_choices(current)]
 
+@bot.tree.command(name="fmrecap", description="Récapitulatif d'une commande à envoyer au client (page imprimable)")
+@app_commands.describe(
+    client="Nom du client, affiché sur le document (facultatif)",
+    salon="Salon concerné (par défaut : celui-ci, même archivé)",
+    tentatives="Afficher aussi le nombre de tentatives et leurs issues",
+)
+async def fmrecap(interaction: discord.Interaction, client: str = "", salon: discord.TextChannel = None, tentatives: bool = False):
+    target = salon or interaction.channel
+    target_id = str(target.id)
+    if not can_tag_channel(interaction.user, target_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut produire le récapitulatif.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    tz = report_tz()
+    now = datetime.datetime.now(tz)
+    guild = interaction.guild
+
+    live = sessions.get(target_id)
+    provisional = live is not None and session_has_activity(live)
+    if provisional:
+        entry = fm_channels().get(target_id) or {}
+        record = build_session_record(target_id, getattr(target, "name", ""), entry.get("owner_id"), live, None, "live")
+        record["live"] = True
+    else:
+        past = [r for r in fm_state().get("history", []) if r.get("ch") == target_id]
+        if not past:
+            return await interaction.followup.send(
+                "Aucune session à récapituler dans ce salon. Le récapitulatif existe pour une session en cours "
+                "ou une session fermée depuis la mise en place de l'historique.", ephemeral=True)
+        record = max(past, key=lambda r: r.get("end") or "")
+
+    owner_id = record.get("owner")
+    try:
+        member = guild.get_member(int(owner_id)) if (guild and owner_id) else None
+    except (TypeError, ValueError):
+        member = None
+    forgemage = getattr(member, "display_name", None) or (f"joueur …{str(owner_id)[-4:]}" if owner_id else "")
+    item = channel_items().get(target_id)
+    recap = build_recap(record, tz, now, forgemage, client=(client or "")[:60], item=item,
+                        show_attempts=tentatives, provisional=provisional)
+
+    icons, item_icon = {}, None
+    if RUNE_IMAGES_ENABLED:
+        try:
+            gallery = await prepare_rune_gallery(record.get("items") or {})
+            icons = gallery["icons"]
+            if item:
+                raw = await asyncio.to_thread(load_item_icons, [item])
+                if item["id"] in raw:
+                    item_icon = "data:image/png;base64," + base64.b64encode(raw[item["id"]]).decode()
+        except Exception as exc:   # le document prime : sans icones plutot que pas de document
+            print(f"[RECAP] icones ignorees : {exc!r}")
+    page = render_recap_html(recap, icons, item_icon)
+    slug = re.sub(r"[^a-z0-9]+", "-", _norm(recap["reference"])).strip("-") or "commande"
+    due = recap["due"]
+    summary = (f"**Récapitulatif de #{recap['reference']}** : "
+               + (f"montant à régler **{format_number(due)} kamas**" if due >= 0 else f"trop-perçu de **{format_number(-due)} kamas**")
+               + (" (provisoire : session en cours)" if provisional else ""))
+    await interaction.followup.send(
+        content=summary + "\nOuvre le fichier dans ton navigateur, puis imprime-le (PDF) ou envoie-le tel quel.",
+        file=discord.File(BytesIO(page.encode("utf-8")), filename=f"recap-{slug}-{recap['when'].strftime('%Y-%m-%d')}.html"),
+        ephemeral=True)
+
 @bot.tree.command(name="fmbilan", description="Page de bilan : chronologie des sessions et totaux par mois, trimestre, année")
 @app_commands.describe(
     periode="Période détaillée dans la chronologie (mois par défaut)",
@@ -2918,7 +3532,7 @@ async def fmbilan(interaction: discord.Interaction, periode: str = "mois", reper
     page = render_report_html(report, owner_name_of, runes, item_icons)
     p = report["period"]
     summary = (f"**{label}** : {p['n']} session(s) · dépensé {format_number(p['total'])} · "
-               f"facturé {format_number(p['total'] + p['adjust'])} · payé {format_number(p['paid'])} kamas")
+               f"facturé {format_number(p['total'] + p['adjust'])} · acomptes {format_number(p['paid'])} kamas")
     if p["n"] == 0:
         summary = f"**{label}** : aucune session sur cette période (la page montre les autres périodes)."
     if start is None:
@@ -2984,7 +3598,7 @@ async def sync(ctx):
     names, error = await sync_commands()
     if error is not None:
         return await ctx.send(f"❌ Synchronisation refusée par Discord : {str(error)[:1500]}")
-    await ctx.send(f"✅ {len(names)} commandes synchronisées : " + ", ".join(f"/{n}" for n in names))
+    await ctx.send(f"✅ {len(names)} commandes synchronisées (version {BOT_VERSION}) : " + ", ".join(f"/{n}" for n in names))
 
 # ---------------- TACHES DE FOND ---------------- #
 # Toutes les 10 secondes : les demandes du site (ouvrir / fermer une session,
@@ -3095,7 +3709,7 @@ async def setup_hook():
 async def on_ready():
     load_data()
     await sync_commands()
-    print(f"Bot connecte en tant que {bot.user}")
+    print(f"Bot connecte en tant que {bot.user} (version {BOT_VERSION})")
     if FM_PERSONAL_CHANNELS:
         await ensure_button_emoji()
         for guild in bot.guilds:
@@ -3183,7 +3797,7 @@ async def on_message(message):
             else:
                 await message.reply(text)
         else:
-            added = commit_entries(session, channel_id, message.author, entries, hashes)
+            added = commit_entries(session, channel_id, message.author, entries, hashes, ref=message.id)
             try:
                 await message.reply(capture_reply_text(message.author, entries, session))
             except discord.HTTPException as exc:

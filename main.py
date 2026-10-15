@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import pytesseract
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageOps, ImageStat, features
 import requests
 from io import BytesIO
 import asyncio
@@ -420,6 +420,7 @@ _DECIMAL = re.compile(r"^\d+(?:[.,]\d+)?$")
 _AMOUNT_SUFFIX = {"k": 1_000, "m": 1_000_000, "kk": 1_000_000}
 
 _SUFFIX_DECIMAL_RE = re.compile(r"^(\d+)\s*(kk|k|m)\s*(\d+)\s*(?:kamas?)?$", re.IGNORECASE)
+MAX_KAMAS_AMOUNT = 1_000_000_000_000   # 1 000 milliards : au-dela, c'est une faute de frappe, jamais une vraie somme
 
 def parse_kamas_amount(raw):
     """
@@ -454,7 +455,7 @@ def parse_kamas_amount(raw):
                 return None
     except InvalidOperation:
         return None
-    if value <= 0 or value != value.to_integral_value():
+    if value <= 0 or value != value.to_integral_value() or value > MAX_KAMAS_AMOUNT:
         return None
     return int(value)
 
@@ -500,8 +501,9 @@ def session_summary(session, title):
     if attempts:
         text += attempts + "\n\n"
     payments = payments_of(session)
+    stock_text = "\n\n" + "\n".join(stock_summary_lines(stock_of(session), session["total"])) if stock_of(session) else ""
     if not payments:
-        return text + f"TOTAL : {format_number(session['total'])} kamas"
+        return text + f"TOTAL : {format_number(session['total'])} kamas" + stock_text
 
     received, charged = payment_totals(session)
     lines = [f"TOTAL DÉPENSÉ : {format_number(session['total'])} kamas"]
@@ -522,7 +524,7 @@ def session_summary(session, title):
         lines.append(f"RESTE À PAYER : {format_number(due)} kamas")
     else:
         lines.append(f"TROP-PERÇU (crédit client) : {format_number(-due)} kamas")
-    return text + "\n".join(lines)
+    return text + "\n".join(lines) + stock_text
 
 # ---------------- ENREGISTREMENT D'UNE CAPTURE ---------------- #
 def aggregate_entries(entries):
@@ -849,17 +851,19 @@ def build_session_record(channel_id, name, owner, session, end, why):
         "items": {n: [v.get("qty", 0), v.get("price", 0)] for n, v in items[:SESSION_HISTORY_ITEMS]},
         "attempts": dict(attempts_of(session)["counts"]), "why": why,
         "payments": [{k: v for k, v in p.items() if k in ("amount", "note", "at")} for p in payments_of(session)][-30:],
+        **({"stock": {k: v for k, v in stock_of(session).items() if k in ("start", "end") and isinstance(v, int)}} if stock_of(session) else {}),
     }
 
 def record_session_history(channel, session, why):
     """Appele quand une session se ferme. Les sessions vides (rien achete, aucun clic) ne sont pas gardees."""
     if not session_has_activity(session):
-        return
+        return None
     entry = fm_channels().get(str(channel.id)) or {}
     history = fm_state().setdefault("history", [])
-    history.append(build_session_record(
-        channel.id, getattr(channel, "name", ""), entry.get("owner_id"), session, now_iso(), why))
+    record = build_session_record(channel.id, getattr(channel, "name", ""), entry.get("owner_id"), session, now_iso(), why)
+    history.append(record)
     del history[:-SESSION_HISTORY_CAP]
+    return record
 
 def live_records(name_of, player_id=None):
     """Sessions EN COURS (d'un joueur, ou de tous si player_id est None), au format des sessions terminees."""
@@ -1018,7 +1022,7 @@ def history_embed(display_name, profile, records, owned_total, without_details):
         embed.add_field(name="🕘 Dernières sessions", value=_cut("\n".join(lines) + more), inline=False)
 
     embed.set_footer(text="Historique détaillé depuis la mise en place de cette fonction. Montant d'une "
-                          "commande = achats + stock apporté, avant paiements.")
+                          "commande = achats + ajustements, avant paiements.")
     return embed
 
 # ---------------- BILAN : PERIODES ET TOTAUX ---------------- #
@@ -1142,13 +1146,17 @@ def record_when(record, tz):
     return None
 
 def _new_agg():
-    return {"n": 0, "total": 0, "adjust": 0, "paid": 0, "tries": 0, "target": 0}
+    return {"n": 0, "total": 0, "adjust": 0, "paid": 0, "tries": 0, "target": 0, "stock_used": 0, "stock_n": 0}
 
 def _add_agg(agg, record):
     agg["n"] += 1
     agg["total"] += record["total"]
     agg["adjust"] += record.get("adjust", 0)
     agg["paid"] += record.get("paid", 0)
+    used = stock_used(stock_of(record))   # sessions dont le stock de depart ET le stock restant sont connus
+    if used is not None:
+        agg["stock_used"] += used
+        agg["stock_n"] += 1
     counts = record.get("attempts") or {}
     agg["tries"] += sum(counts.values())
     agg["target"] += counts.get(FM_OUTCOMES[0][0], 0)
@@ -1187,7 +1195,9 @@ def build_report(records, tz, start, end, label, now, player_label=None, sample=
         _add_agg(players.setdefault(r.get("owner"), _new_agg()), r)
         item = r.get("item")   # equipement associe au salon par /fmitem (ajoute par la commande, jamais stocke)
         if item:
-            _add_agg(by_item.setdefault(item["id"], {"item": item, "agg": _new_agg()})["agg"], r)
+            slot = by_item.setdefault(item["id"], {"item": item, "agg": _new_agg(), "records": []})
+            _add_agg(slot["agg"], r)
+            slot["records"].append((_w, r))
         else:
             room = r.get("name") or "salon"
             if room not in unlinked:
@@ -1665,7 +1675,20 @@ th[aria-sort=descending]::after{content:" ▼";font-size:.7em}
 .warn{color:var(--warn)}
 .chip.item{display:inline-flex;align-items:center;gap:6px;font-weight:600;border-color:var(--accent)}
 .lv{color:var(--muted);font-weight:400}
-@media print{.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
+.shot{position:relative;display:inline-block;color:inherit;text-decoration:none;cursor:zoom-in}
+.shot:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:12px}
+.tile{position:relative}
+a.tile.shot{display:flex}
+.camph{font-size:1.8rem;opacity:.75}
+.cam{position:absolute;right:-5px;bottom:-5px;font-size:.68rem;line-height:1;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:2px 4px;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.lb{display:none;position:fixed;inset:0;z-index:60;align-items:center;justify-content:center;background:rgba(10,12,20,.72);padding:16px}
+.lb:target{display:flex}
+.lbx{position:absolute;inset:0;cursor:zoom-out}
+.lb figure{position:relative;margin:0;background:var(--card);border:1px solid var(--line);padding:10px;border-radius:14px;max-width:min(94vw,860px);box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.lb img{display:block;max-width:100%;max-height:78vh;margin:0 auto;border-radius:8px}
+.lb figcaption{display:flex;justify-content:space-between;align-items:center;gap:12px;color:var(--muted);font-size:.85rem;padding:8px 4px 0}
+.lb figcaption a{color:var(--accent);text-decoration:none;font-weight:600;white-space:nowrap}
+@media print{.lb,.cam{display:none!important}.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
 """
 
 REPORT_JS = """(function(){
@@ -1713,7 +1736,26 @@ def _kamas_short(n):
         return sign + f"{value:f}".rstrip("0").rstrip(".").replace(".", ",") + unit
     return f"{sign}{n}"
 
-def render_report_html(report, owner_name_of, runes=None, item_icons=None):
+def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots=None):
+    shots = shots or {}          # {id du salon: data URI de la capture de l'equipement termine}
+    shot_ids, shot_notes = {}, {}
+
+    def shot_link(ch, inner, record, when, cls="", title=""):
+        """Entoure une image d'un lien vers la capture du salon (survol = apercu, clic ou toucher = grand)."""
+        ch = str(ch)
+        if ch not in shots:
+            return inner
+        if ch not in shot_ids:
+            shot_ids[ch] = f"s{len(shot_ids) + 1}"
+            linked = record.get("item")
+            what = linked["name"] if linked else f"#{record.get('name') or 'salon'}"
+            who = owner_name_of(record.get("owner"))
+            date = f"{when.day} {MONTHS_FR[when.month - 1]} {when.year}"
+            shot_notes[ch] = " · ".join(x for x in (what, who, date) if x)
+        tip = html_lib.escape(title or "Voir la capture de l'équipement terminé", quote=True)
+        return (f'<a class="shot {cls}" href="#{shot_ids[ch]}" title="{tip}">{inner}'
+                '<span class="cam" aria-hidden="true">📷</span></a>')
+
     esc = html_lib.escape
     tz, start, end = report["tz"], report["start"], report["end"]
     period = report["period"]
@@ -1734,7 +1776,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 (amount(agg["paid"]), agg["paid"]), (str(agg["tries"]), agg["tries"]),
                 (f"{agg['target']} ({rate(agg)})" if agg["tries"] else "—", rate_value)]
 
-    agg_heads = [("Sessions", "num", ""), ("Dépensé", "num", ""), ("Stock ajouté", "num", ""), ("Facturé", "num", ""),
+    agg_heads = [("Sessions", "num", ""), ("Dépensé", "num", ""), ("Ajustements", "num", "Montants ajoutés au total avec /fmpay -X"), ("Facturé", "num", ""),
                  ("Acomptes", "num", "Paiements enregistrés avec /fmpay pendant la session"), ("Tentatives", "num", ""), (target_label, "num", "Tri sur le taux de réussite")]
 
     def sortable_table(head_specs, rows):
@@ -1762,10 +1804,12 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
     # ---- cartes ----
     cards = [("Sessions", str(period["n"]), ""),
              ("Dépensé", amount(period["total"]), "kamas, achats"),
-             ("Stock ajouté", amount(period["adjust"]), "kamas, ajustements"),
-             ("Facturé", amount(period["total"] + period["adjust"]), "kamas, dépensé + stock"),
+             ("Ajustements", amount(period["adjust"]), "kamas, ajoutés au total"),
+             ("Facturé", amount(period["total"] + period["adjust"]), "kamas, dépensé + ajustements"),
              ("Acomptes", amount(period["paid"]), "kamas, versés en cours de session"),
              ("Tentatives", str(period["tries"]), f"{target_emoji} {period['target']} · {rate(period)}")]
+    if period["stock_n"]:   # suivi separe : jamais dans le facture
+        cards.append(("Stock consommé", amount(period["stock_used"]), f"kamas, {period['stock_n']} session(s) renseignée(s)"))
     parts.append('<div class="kpis">' + "".join(
         f'<div class="kpi"><span class="lab">{esc(t)}</span><b>{v}</b><small>{esc(sub)}</small></div>' for t, v, sub in cards) + "</div>")
 
@@ -1794,9 +1838,13 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 tries = sum(counts.values())
                 money = [f"dépensé {format_number(r['total'])}"]
                 if r.get("adjust"):
-                    money.append(f"stock +{format_number(r['adjust'])}")
+                    money.append(f"ajustement +{format_number(r['adjust'])}")
                 if r.get("paid"):
                     money.append(f"acompte {format_number(r['paid'])}")
+                st = stock_of(r)
+                if st:   # suivi du stock : « stock 20 M → 5 M » (? = non renseigne)
+                    money.append("stock " + (_kamas_short(st["start"]) if st.get("start") is not None else "?")
+                                 + " → " + (_kamas_short(st["end"]) if st.get("end") is not None else "?"))
                 chips = ["".join(f'<span class="chip">{esc(m)}</span>' for m in money)]
                 if tries:
                     chips.append('<span class="chip">' + esc("  ".join(
@@ -1804,14 +1852,18 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
                 if owner:
                     chips.append(f'<span class="chip who">{esc(owner)}</span>')
                 linked = r.get("item")
-                tile = ""
+                tile, uri, label = "", None, ""
                 if linked:
                     uri = (item_icons or {}).get(linked["id"])
                     lvl = f" · niv. {linked['level']}" if linked.get("level") else ""
                     label = linked["name"] + lvl
                     chips.insert(0, f'<span class="chip item">{esc(label)}</span>')
-                    if uri:   # grande vignette carree entre le contenu et le montant
-                        tile = f'<div class="tile" title="{esc(label)}"><img src="{uri}" alt="" width="64" height="64"></div>'
+                inner = f'<img src="{uri}" alt="" width="64" height="64">' if uri else ""
+                if str(r.get("ch")) in shots:   # capture de l'equipement termine : vignette cliquable (appareil photo si pas d'icone)
+                    tile = shot_link(r.get("ch"), inner or '<span class="camph" aria-hidden="true">📷</span>', r, when,
+                                     cls="tile", title=label)
+                elif inner:   # grande vignette carree entre le contenu et le montant
+                    tile = f'<div class="tile" title="{esc(label)}">{inner}</div>'
                 top = list((r.get("items") or {}).items())[:3]
                 items_line = ""
                 if top:
@@ -1892,6 +1944,10 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
             pic = (f'<img class="ico" alt="" src="{uri}" width="36" height="36">' if uri
                    else '<span class="ico ph" title="Image indisponible">?</span>')
             lvl = f' <span class="lv">niv. {it["level"]}</span>' if it.get("level") else ""
+            with_shot = [(w, rr) for w, rr in slot["records"] if str(rr.get("ch")) in shots]
+            if with_shot:   # la capture la plus recente de cet equipement
+                w_best, r_best = max(with_shot, key=lambda x: x[0])
+                pic = shot_link(r_best.get("ch"), pic, r_best, w_best)
             rows.append(([(f'<span class="rname">{pic}<span>{esc(it["name"])}{lvl}</span></span>', it["name"])]
                          + agg_cells(agg), False))
         parts.append(sortable_table([("Équipement", "text", "")] + agg_heads, rows))
@@ -1922,8 +1978,9 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
     first = report["first"].strftime("%d/%m/%Y") if report["first"] else "—"
     notes = [f"Données enregistrées depuis le {first} : les sessions fermées avant la mise en place de l'historique n'y figurent pas.",
              "Une session compte à la date de sa fermeture (à la date de son début si elle est en cours).",
-             "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Acomptes = paiements enregistrés "
-             "avec /fmpay pendant la session ; le règlement final du client n'est pas enregistré dans le bot.",
+             "Dépensé = achats lus sur les captures. Facturé = dépensé + ajustements (/fmpay -X). Acomptes = paiements enregistrés "
+             "avec /fmpay pendant la session ; le règlement final du client n'est pas enregistré dans le bot. Stock consommé = "
+             "stock de départ - stock restant : un suivi séparé, jamais compté dans le facturé.",
              f"Mois, trimestres et années sont lus en heure de {esc(str(tz))}."]
     if (item_icons or any(r["icon"] for r in (runes or {}).get("rows", []))):
         if report["sample"]:
@@ -1937,28 +1994,57 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None):
         gallery_notes.append(esc(f"{len(report['unlinked'])} salon(s) sans équipement associé : "
                                  + ", ".join("#" + n for n in shown) + more
                                  + ". Associe-les avec /fmitem (même un salon archivé)."))
+    if report.get("shots_skipped"):
+        gallery_notes.append(f"{report['shots_skipped']} capture(s) d'équipement non intégrée(s) pour tenir dans la taille "
+                             "maximale d'un fichier Discord : relance le bilan sur une période plus courte pour les voir.")
     notes.extend(gallery_notes)
     if report["undated"]:
         notes.append(f"{report['undated']} session(s) sans date lisible n'apparaissent pas dans la chronologie ni dans les totaux.")
     parts.append('<ul class="notes">' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>")
 
+    # Captures : UNE seule copie de chaque image (dans la reserve en fin de page), referencee par les liens des
+    # cartes et du tableau. Apercu au survol (:has) pour la souris, grand format au clic ou au toucher (:target).
+    pool, hover_css = [], []
+    for ch, sid in shot_ids.items():
+        pool.append(f'<div class="lb" id="{sid}"><a class="lbx" href="#fermer" aria-label="Fermer"></a><figure>'
+                    f'<img src="{shots[ch]}" alt="Capture de l\'équipement terminé">'
+                    f'<figcaption><span>{esc(shot_notes[ch])}</span><a href="#fermer">Fermer ✕</a></figcaption></figure></div>')
+        sel = (f'body:has(a.shot[href="#{sid}"]:hover) #{sid}:not(:target),'
+               f'body:has(a.shot[href="#{sid}"]:focus-visible) #{sid}:not(:target)')
+        sel_fig = ",".join(f"{part} figure" for part in sel.split(","))
+        sel_cap = ",".join(f"{part} figcaption a" for part in sel.split(","))
+        sel_img = ",".join(f"{part} img" for part in sel.split(","))
+        # Largeur de l'apercu = espace libre a droite de la page (980 px centres), entre 300 et 460 px : sur grand ecran
+        # il ne recouvre rien, sur petite fenetre il reste lisible.
+        hover_css.append(f"{sel}{{display:flex;inset:auto 20px 20px auto;background:none;padding:0;pointer-events:none}}"
+                         f"{sel_fig}{{max-width:clamp(300px,calc((100vw - 1000px)/2 - 30px),460px)}}"
+                         f"{sel_img}{{max-height:70vh}}{sel_cap}{{display:none}}")
+    shot_css = ("@media (hover:hover){" + "".join(hover_css) + "}") if hover_css else ""
     return ("<!DOCTYPE html>\n<html lang=\"fr\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; "
             f"img-src data:; script-src '{REPORT_JS_HASH}'\">"
-            f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}</style></head><body><main>"
-            + "".join(parts) + f"</main><script>{REPORT_JS}</script></body></html>")
+            f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}{shot_css}</style></head><body><main>"
+            + "".join(parts) + f"</main>{''.join(pool)}<script>{REPORT_JS}</script></body></html>")
 
 # ---------------- CORRECTIONS DE SESSION : /fmreset confirme, /fmundo, /fmadd ---------------- #
 CAPTURE_HISTORY_CAP = 40   # captures annulables par session (les plus recentes)
 
-async def perform_reset(interaction, channel_id):
-    """Remet la session a zero (le journal des statistiques est conserve) et previent le site et le panneau."""
+def reset_session_state(channel_id):
     sessions[channel_id] = empty_session()
     touch_channel(channel_id)
     save_data()
+
+async def after_reset(interaction, channel_id):
+    """Apres une remise a zero : previent le site, pose la question du stock, remet le panneau a jour."""
     await send_event(site_event("session-reset", interaction.id, interaction.channel, interaction.created_at))
+    await post_stock_prompt(interaction.channel, sessions[channel_id])
     await sync_attempt_panel(interaction.channel, sessions[channel_id])
+
+async def perform_reset(interaction, channel_id):
+    """Remet la session a zero (le journal des statistiques est conserve) puis previent site, stock et panneau."""
+    reset_session_state(channel_id)
+    await after_reset(interaction, channel_id)
 
 class ResetConfirmView(discord.ui.View):
     """Confirmation avant d'effacer une session : rien n'est supprime sans un clic explicite."""
@@ -1983,8 +2069,9 @@ class ResetConfirmView(discord.ui.View):
             return
         self.done = True
         self.stop()
-        await perform_reset(interaction, self.channel_id)
+        reset_session_state(self.channel_id)
         await interaction.response.edit_message(content="Session réinitialisée !", view=None)
+        await after_reset(interaction, self.channel_id)
 
     @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2190,13 +2277,14 @@ tr.sub td{font-weight:650;border-bottom:2px solid #1d2333}
 .attempts{display:flex;gap:10px;flex-wrap:wrap}
 .attempts span{border:1px solid #e3e6ee;border-radius:10px;padding:6px 12px;background:#f6f7fb}
 .foot{margin-top:30px;color:#667085;font-size:.82rem;border-top:1px solid #eceef4;padding-top:10px}
+.note{color:#667085;font-size:.82rem;margin:6px 0 0}
 @page{size:A4;margin:16mm}
 .keep{break-inside:avoid}
 h2{break-after:avoid}
 @media print{body{background:#fff;font-size:12px;line-height:1.35}.sheet{margin:0;border:0;border-radius:0;padding:0;max-width:none}
 tr,.itemcard,.keep{break-inside:avoid}h1{font-size:1.3rem}h2{margin:14px 0 4px}.banner{margin-top:8px;padding:5px 12px}
 .meta{margin:10px 0 0;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.itemcard{margin-top:10px;padding:6px 12px}
-.tile{width:56px;height:56px}.tile img{width:46px;height:46px}th,td{padding:3px 6px}.ico,.ph{width:22px;height:22px}
+.tile{width:56px;height:56px}.tile img{width:46px;height:46px}th,td{padding:2px 6px}.ico,.ph{width:22px;height:22px}
 .grand td{font-size:1.1rem;padding-top:6px}.foot{margin-top:12px}}
 @media (max-width:560px){.sheet{margin:0;border-radius:0;padding:22px 16px}.avg{display:none}th{white-space:normal}}
 @media (max-width:400px){.sheet{padding:18px 12px}.grand td{font-size:1.05rem}h1{font-size:1.35rem}}
@@ -2211,7 +2299,7 @@ def build_recap(record, tz, now, forgemage, client="", item=None, show_attempts=
     adjust_total, paid_total = record.get("adjust", 0), record.get("paid", 0)
     payments = record.get("payments")
     if payments is None:   # session fermee avant l'enregistrement du detail : on ne connait que les totaux
-        adjustments = [{"amount": adjust_total, "note": "Stock apporté / ajustements", "at": None}] if adjust_total else []
+        adjustments = [{"amount": adjust_total, "note": "Ajustements", "at": None}] if adjust_total else []
         deposits = [{"amount": paid_total, "note": "Acomptes versés", "at": None}] if paid_total else []
     else:
         adjustments = [{"amount": -p["amount"], "note": p.get("note") or "", "at": p.get("at")} for p in payments if p["amount"] < 0]
@@ -2220,7 +2308,12 @@ def build_recap(record, tz, now, forgemage, client="", item=None, show_attempts=
             gap = expected - sum(r["amount"] for r in rows)   # detail tronque : la difference reste visible
             if gap:
                 rows.append({"amount": gap, "note": label, "at": None})
+    stock = stock_of(record)   # suivi separe : n'entre JAMAIS dans « due »
+    used = stock_used(stock)
+    stock_figures = ({"start": stock.get("start"), "end": stock.get("end"), "used": used,
+                      "runes_used": total + used if used is not None else None} if stock else None)
     return {
+        "stock": stock_figures,
         "forgemage": forgemage, "client": client.strip(), "reference": record.get("name") or "", "when": record_when(record, tz) or now,
         "now": now, "tz": tz, "item": item, "lines": lines, "other": other, "total": total,
         "adjustments": adjustments, "deposits": deposits, "due": total + adjust_total - paid_total,
@@ -2272,7 +2365,7 @@ def render_recap_html(recap, icons=None, item_icon=None):
     settle = [f'<tr><td>Total des achats</td><td class="r">{amt(recap["total"])}</td></tr>']
     for a in recap["adjustments"]:
         note = f" · {esc(a['note'])}" if a["note"] else ""
-        settle.append(f'<tr><td class="plus">Stock apporté{note}</td><td class="r plus">+ {amt(a["amount"])}</td></tr>')
+        settle.append(f'<tr><td class="plus">Ajustement{note}</td><td class="r plus">+ {amt(a["amount"])}</td></tr>')
     for d in recap["deposits"]:
         note = f" · {esc(d['note'])}" if d["note"] else ""
         try:
@@ -2288,6 +2381,18 @@ def render_recap_html(recap, icons=None, item_icon=None):
         settle.append(f'<tr class="grand"><td>Trop-perçu (en votre faveur)</td><td class="r">{amt(-due)}</td></tr>')
     body.append("<section class=\"keep\"><h2>Décompte</h2><table><tbody>" + "".join(settle) + "</tbody></table></section>")
 
+    figures = recap.get("stock")
+    if figures:   # information separee : le stock n'entre pas dans le montant a regler
+        start, end, used_value = figures["start"], figures["end"], figures["used"]
+        rows_stock = [f'<tr><td>Stock de départ</td><td class="r">{amt(start) if start is not None else "non renseigné"}</td></tr>',
+                      f'<tr><td>Stock restant</td><td class="r">{amt(end) if end is not None else "non renseigné"}</td></tr>']
+        if used_value is not None:
+            rows_stock.append(f'<tr class="sub"><td>{"Stock consommé" if used_value >= 0 else "Stock en hausse (achats non utilisés)"}</td>'
+                              f'<td class="r">{amt(abs(used_value))}</td></tr>')
+            rows_stock.append(f'<tr><td>Runes utilisées au total (achats + stock consommé)</td><td class="r">{amt(figures["runes_used"])}</td></tr>')
+        body.append('<section class="keep"><h2>Stock de runes</h2><table><tbody>' + "".join(rows_stock)
+                    + '</tbody></table><p class="note">Information à part : le stock n\'entre pas dans le montant à régler.</p></section>')
+
     if recap["attempts"]:
         counts = recap["attempts"]
         chips = "".join(f"<span>{emoji} {esc(label)} : <b>{counts.get(key, 0)}</b></span>" for key, label, emoji, _st in FM_OUTCOMES)
@@ -2299,6 +2404,395 @@ def render_recap_html(recap, icons=None, item_icon=None):
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">"
             f"<title>Récapitulatif · {esc(recap['reference'])}</title><style>{RECAP_CSS}</style></head><body><main class=\"sheet\">"
             + "".join(head) + "".join(body) + foot + "</main></body></html>")
+
+# ---------------- STOCK DE DEPART ET CAPTURE DE L'EQUIPEMENT TERMINE ---------------- #
+# Le stock de runes en inventaire est un SUIVI : valeur au depart, valeur restante a l'arret, donc consommation.
+# Il n'entre JAMAIS dans le montant a regler (ni comme ajustement, ni comme paiement) : un stock a facturer au client
+# se declare explicitement avec /fmpay -X. Stocke dans la session (puis dans l'historique) sous la cle "stock" :
+# {"start": valeur au depart, "end": valeur restante} ; une cle absente = non renseigne.
+STOCK_NOTE = "stock de départ"   # ancienne note d'ajustement : ne sert plus qu'a migrer les sessions en cours
+STOCK_NONE_WORDS = {"0", "aucun", "aucune", "non", "rien", "-"}
+STOCK_PROMPT_TEXT = (
+    "💰 **Stock de runes déjà en inventaire ?**\n"
+    "Si tu as déjà des runes en stock pour cette FM, indique leur **valeur totale**. Elle sert à suivre ta consommation "
+    "de stock (`/fmstop` te demandera ce qu'il en reste) : elle n'est **pas** ajoutée au montant à régler.\n"
+    "Sinon, clique sur « Aucun stock ». Tu peux aussi le renseigner plus tard avec `/fmstock`.")
+STOCK_END_TEXT = (
+    "📦 **Stock restant ?**\n"
+    "Tu avais **{start} kamas** de runes en stock au départ. Indique la valeur totale de ce qu'il te reste en inventaire "
+    "pour calculer la consommation de stock. Cela ne change pas le montant à régler.")
+
+def stock_of(holder):
+    """Stock declare d'une session ou d'un enregistrement d'historique : {} si rien n'a ete renseigne."""
+    stock = (holder or {}).get("stock")
+    return stock if isinstance(stock, dict) else {}
+
+def set_stock(holder, field, value):
+    """Renseigne (ou efface, si value est None) le stock de depart ("start") ou restant ("end")."""
+    stock = holder.setdefault("stock", {})
+    if value is None:
+        stock.pop(field, None)
+    else:
+        stock[field] = value
+    if not stock:
+        holder.pop("stock", None)
+
+def stock_used(stock):
+    """Stock consomme = depart - restant (negatif : le stock a augmente). None si l'une des deux valeurs manque."""
+    start, end = stock.get("start"), stock.get("end")
+    if isinstance(start, int) and isinstance(end, int):
+        return start - end
+    return None
+
+def stock_summary_lines(stock, purchases=None):
+    """Lignes de texte du suivi de stock ([] si rien n'est declare). purchases : total des achats de la session."""
+    start, end = stock.get("start"), stock.get("end")
+    if start is None and end is None:
+        return []
+    head = ["départ " + (format_number(start) if start is not None else "non renseigné"),
+            "restant " + (format_number(end) if end is not None else "à renseigner")]
+    lines = [f"STOCK : {' · '.join(head)} kamas (suivi séparé : hors montant à payer)"]
+    used = stock_used(stock)
+    if used is not None:
+        lines.append(f"Stock consommé : {format_number(used)} kamas" if used >= 0
+                     else f"Stock en hausse de {format_number(-used)} kamas (achats non utilisés)")
+        if purchases is not None:
+            lines.append(f"Runes utilisées au total (achats + stock consommé) : {format_number(purchases + used)} kamas")
+    return lines
+
+def migrate_stock_adjustments():
+    """
+    Version precedente : le stock de depart etait enregistre comme un AJUSTEMENT (donc ajoute au montant du).
+    Les sessions EN COURS qui l'avaient declare sont converties une fois : l'ajustement disparait des paiements et sa
+    valeur devient le stock de depart. Idempotent. Les sessions deja fermees ne sont pas touchees : on ne peut pas
+    distinguer un stock declare par la question d'un ajustement saisi a la main avec /fmpay.
+    """
+    changed = 0
+    for key, session in list(sessions.items()):
+        if key == "_fm" or not isinstance(session, dict) or "stock" in session:
+            continue
+        prompt = session.get("stock_prompt")
+        amount = prompt.get("amount") if isinstance(prompt, dict) else None
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            continue
+        payments = session.get("payments") or []
+        for i, payment in enumerate(payments):
+            if payment.get("amount") == -amount and payment.get("note") == STOCK_NOTE:
+                del payments[i]
+                set_stock(session, "start", amount)
+                changed += 1
+                break
+    if changed:
+        save_data()
+        print(f"[STOCK] {changed} session(s) en cours migree(s) : le stock de depart n'est plus compte dans le montant a regler.")
+    return changed
+
+async def post_stock_prompt(channel, session):
+    """Pose la question du stock de depart. Ne leve JAMAIS : c'est un confort, jamais un prerequis."""
+    try:
+        message = await channel.send(STOCK_PROMPT_TEXT, view=StockPromptView())
+        session["stock_prompt"] = {"message_id": str(message.id), "done": False}
+        save_data()
+    except Exception as exc:
+        print(f"[STOCK] question impossible dans #{getattr(channel, 'name', '?')} : {exc}")
+
+async def _close_stock_prompt(channel, message_id, text):
+    try:
+        await channel.get_partial_message(int(message_id)).edit(content=text, view=None)
+    except Exception as exc:   # message supprime, droits retires : sans consequence
+        print(f"[STOCK] message de question non mis a jour : {exc}")
+
+STOCK_AMOUNT_HELP = ("Montant non compris (ou trop grand) : « {raw} ». Exemples : `1M6`, `2 450 000`, `500k`. "
+                     "Rien n'a été enregistré : clique de nouveau sur le bouton.")
+
+class StockModal(discord.ui.Modal):
+    """Fenetre de saisie du stock de DEPART."""
+    def __init__(self, channel_id, message_id):
+        super().__init__(title="Stock de runes en inventaire", timeout=300)
+        self.channel_id, self.message_id = channel_id, message_id
+        self.amount = discord.ui.TextInput(label="Valeur totale du stock (kamas)", placeholder="ex : 1M6, 2 450 000, 500k",
+                                           min_length=1, max_length=20, required=True)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        session = sessions.get(self.channel_id)
+        prompt = (session or {}).get("stock_prompt")
+        if session is None or not prompt or prompt.get("done") or prompt.get("message_id") != self.message_id:
+            return await interaction.response.send_message("Cette question n'est plus d'actualité : rien n'a été enregistré.", ephemeral=True)
+        raw = str(self.amount.value).strip()
+        if raw.lower() in STOCK_NONE_WORDS:
+            prompt["done"], prompt["skipped"] = True, True
+            save_data()
+            await interaction.response.send_message("Aucun stock de départ déclaré.")
+            return await _close_stock_prompt(interaction.channel, self.message_id, "Aucun stock de départ déclaré.")
+        value = parse_kamas_amount(raw)
+        if value is None:
+            return await interaction.response.send_message(STOCK_AMOUNT_HELP.format(raw=raw), ephemeral=True)
+        set_stock(session, "start", value)
+        prompt["done"], prompt["amount"] = True, value
+        touch_channel(self.channel_id)
+        save_data()
+        await interaction.response.send_message(
+            f"📦 Stock de départ enregistré : **{format_number(value)} kamas**. Suivi séparé : il n'entre pas dans le montant "
+            "à régler.\n`/fmstock depart:aucun` pour corriger.")
+        await _close_stock_prompt(interaction.channel, self.message_id,
+                                  f"✅ Stock de départ enregistré : {format_number(value)} kamas, par <@{interaction.user.id}>.")
+
+class StockPromptView(discord.ui.View):
+    """Boutons persistants (survivent aux redemarrages) : chaque question n'est valable qu'UNE fois."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _open_prompt(self, interaction):
+        channel_id = str(interaction.channel.id)
+        session = sessions.get(channel_id)
+        if session is None:
+            await interaction.response.send_message("Aucune session active.", ephemeral=True)
+            return None
+        if not can_tag_channel(interaction.user, channel_id):
+            await interaction.response.send_message("Seul le propriétaire du salon (ou un administrateur) peut répondre.", ephemeral=True)
+            return None
+        prompt = session.get("stock_prompt")
+        if not prompt or prompt.get("done") or prompt.get("message_id") != str(interaction.message.id):
+            await interaction.response.send_message("Cette question n'est plus d'actualité (déjà traitée, ou nouvelle session).", ephemeral=True)
+            return None
+        return session
+
+    @discord.ui.button(label="Renseigner mon stock", style=discord.ButtonStyle.primary, emoji="💰", custom_id="fm:stock:enter")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._open_prompt(interaction) is None:
+            return
+        await interaction.response.send_modal(StockModal(str(interaction.channel.id), str(interaction.message.id)))
+
+    @discord.ui.button(label="Aucun stock", style=discord.ButtonStyle.secondary, custom_id="fm:stock:skip")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = await self._open_prompt(interaction)
+        if session is None:
+            return
+        session["stock_prompt"]["done"] = True
+        session["stock_prompt"]["skipped"] = True
+        save_data()
+        await interaction.response.edit_message(
+            content="Aucun stock de départ déclaré. (Tu pourras en ajouter un plus tard avec `/fmstock`.)", view=None)
+
+# ---- stock RESTANT : meme fenetre, posee apres /fmstop ----
+# La session est deja fermee : la reponse met a jour son enregistrement d'historique (retrouve par le message de la question).
+def find_stop_record(message_id):
+    for record in reversed(fm_state().get("history", [])):
+        prompt = record.get("stock_prompt")
+        if isinstance(prompt, dict) and prompt.get("message_id") == str(message_id):
+            return record
+    return None
+
+async def post_stock_end_prompt(channel, record):
+    """Apres /fmstop : demande le stock restant, SEULEMENT si un stock de depart avait ete declare. Ne leve JAMAIS."""
+    start = stock_of(record).get("start")
+    if not start:
+        return
+    try:
+        message = await channel.send(STOCK_END_TEXT.format(start=format_number(start)), view=StockEndPromptView())
+        record["stock_prompt"] = {"message_id": str(message.id), "done": False}
+        save_data()
+    except Exception as exc:
+        print(f"[STOCK] question du stock restant impossible dans #{getattr(channel, 'name', '?')} : {exc}")
+
+def apply_stock_end(record, value):
+    """Enregistre le stock restant, referme la question et retourne le texte de la quantification."""
+    set_stock(record, "end", value)
+    record["stock_prompt"]["done"] = True
+    return "📦 " + "\n".join(stock_summary_lines(stock_of(record), record.get("total", 0)))
+
+class StockEndModal(discord.ui.Modal):
+    """Fenetre de saisie du stock RESTANT."""
+    def __init__(self, channel_id, message_id):
+        super().__init__(title="Stock restant en inventaire", timeout=300)
+        self.channel_id, self.message_id = channel_id, message_id
+        self.amount = discord.ui.TextInput(label="Valeur totale du stock restant (kamas)", placeholder="ex : 500k, 1M2 ; 0 s'il ne reste rien",
+                                           min_length=1, max_length=20, required=True)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = find_stop_record(self.message_id)
+        if record is None or record["stock_prompt"].get("done"):
+            return await interaction.response.send_message("Cette question n'est plus d'actualité : rien n'a été enregistré.", ephemeral=True)
+        raw = str(self.amount.value).strip()
+        value = 0 if raw.lower() in STOCK_NONE_WORDS else parse_kamas_amount(raw)
+        if value is None:
+            return await interaction.response.send_message(STOCK_AMOUNT_HELP.format(raw=raw).replace("Renseigner mon stock", "Renseigner le stock restant"), ephemeral=True)
+        text = apply_stock_end(record, value)
+        save_data()
+        await interaction.response.send_message(text[:1990])
+        await _close_stock_prompt(interaction.channel, self.message_id,
+                                  f"✅ Stock restant enregistré : {format_number(value)} kamas, par <@{interaction.user.id}>.")
+
+class StockEndPromptView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _open_prompt(self, interaction):
+        record = find_stop_record(interaction.message.id)
+        if record is None or record["stock_prompt"].get("done"):
+            await interaction.response.send_message("Cette question n'est plus d'actualité (déjà traitée).", ephemeral=True)
+            return None
+        if not can_tag_channel(interaction.user, str(interaction.channel.id)):
+            await interaction.response.send_message("Seul le propriétaire du salon (ou un administrateur) peut répondre.", ephemeral=True)
+            return None
+        return record
+
+    @discord.ui.button(label="Renseigner le stock restant", style=discord.ButtonStyle.primary, emoji="📦", custom_id="fm:stockend:enter")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._open_prompt(interaction) is None:
+            return
+        await interaction.response.send_modal(StockEndModal(str(interaction.channel.id), str(interaction.message.id)))
+
+    @discord.ui.button(label="Plus rien en stock", style=discord.ButtonStyle.secondary, custom_id="fm:stockend:none")
+    async def none_left(self, interaction: discord.Interaction, button: discord.ui.Button):
+        record = await self._open_prompt(interaction)
+        if record is None:
+            return
+        text = apply_stock_end(record, 0)
+        save_data()
+        await interaction.response.edit_message(content=text[:1990], view=None)
+
+# ---- capture de l'equipement termine : traitement, stockage sur disque, budget de taille ----
+# Les captures sont des FICHIERS (jamais dans data.json, qui est reecrit a chaque clic) et sont toujours
+# re-encodees : metadonnees retirees, dimensions et poids plafonnes, aucune image brute n'est conservee.
+SHOT_DIR = os.environ.get("ITEM_SHOT_DIR") or os.path.join(os.path.dirname(DATA_PATH) or ".", "item_shots")
+SHOT_MAX_INPUT = 8_000_000        # octets acceptes en entree
+SHOT_MAX_PIXELS = 40_000_000      # protection contre les images pieges (bombes de decompression)
+SHOT_MAX_SIZE = (800, 1200)       # largeur, hauteur maximales apres reduction
+SHOT_MAX_BYTES = 250_000          # poids maximal apres encodage
+SHOT_FORMATS = {"PNG", "JPEG", "WEBP", "GIF"}
+
+class ShotError(Exception):
+    """Capture refusee : le message est pret a etre affiche a l'utilisateur."""
+
+def encode_shot(raw):
+    """Image brute -> {"data", "w", "h", "ext"} (WebP, ou JPEG si WebP indisponible). Leve ShotError."""
+    if len(raw) > SHOT_MAX_INPUT:
+        raise ShotError("Image trop lourde (8 Mo au maximum).")
+    try:
+        image = Image.open(BytesIO(raw))
+        if image.format not in SHOT_FORMATS:
+            raise ShotError("Format non pris en charge : envoie une capture PNG, JPEG ou WebP.")
+        if image.width * image.height > SHOT_MAX_PIXELS:
+            raise ShotError("Image trop grande (dimensions) : réduis la capture.")
+        image.load()
+    except ShotError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise ShotError("Image trop grande (dimensions) : réduis la capture.") from exc
+    except Exception as exc:
+        raise ShotError("Fichier illisible : ce n'est pas une image valide.") from exc
+    image = ImageOps.exif_transpose(image)
+    has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
+    image = image.convert("RGBA" if has_alpha else "RGB")
+    image.thumbnail(SHOT_MAX_SIZE, Image.LANCZOS)   # ne grossit jamais une petite image
+    use_webp = features.check("webp")
+    for quality, scale in ((82, 1.0), (74, 1.0), (66, 0.85), (58, 0.7), (50, 0.55)):
+        work = image if scale == 1.0 else image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.LANCZOS)
+        buffer = BytesIO()
+        if use_webp:
+            work.save(buffer, "WEBP", quality=quality, method=4)
+        else:
+            work.convert("RGB").save(buffer, "JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= SHOT_MAX_BYTES:
+            return {"data": data, "w": work.width, "h": work.height, "ext": "webp" if use_webp else "jpg"}
+    raise ShotError("Image trop complexe : plus de 250 Ko même après réduction. Envoie une capture plus simple ou plus petite.")
+
+def channel_shots():
+    return fm_state().setdefault("channel_shots", {})
+
+def shot_file(channel_id, ext):
+    return os.path.join(SHOT_DIR, f"{int(channel_id)}.{ext}")   # int() : l'identifiant ne peut jamais sortir du dossier
+
+def save_shot(channel_id, info):
+    """Ecrit la capture (atomique) et retire une eventuelle ancienne version d'un autre format."""
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    path = shot_file(channel_id, info["ext"])
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(info["data"])
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    for ext in ("webp", "jpg"):
+        if ext != info["ext"]:
+            try:
+                os.remove(shot_file(channel_id, ext))
+            except OSError:
+                pass
+
+def remove_shot(channel_id):
+    removed = False
+    for ext in ("webp", "jpg"):
+        try:
+            os.remove(shot_file(channel_id, ext))
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+def shots_dir_ephemeral():
+    """
+    True si les captures seront PERDUES a la prochaine mise a jour : bot dans Docker et dossier sur le meme
+    systeme de fichiers que la racine du conteneur (donc pas un volume). Heuristique, utilisee pour avertir seulement.
+    """
+    try:
+        if not os.path.exists("/.dockerenv"):
+            return False
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        return os.stat(SHOT_DIR).st_dev == os.stat("/").st_dev
+    except OSError:
+        return False
+
+EPHEMERAL_SHOT_WARNING = ("⚠️ Le dossier des captures n'est pas conservé entre deux mises à jour du bot : elles seraient "
+                          "perdues au prochain `docker compose up -d --build`. Ajoute `./item_shots:/app/item_shots` "
+                          "aux `volumes` du docker-compose.yml.")
+
+def shot_budget(guild):
+    """Octets (base64) que les captures peuvent occuper dans le bilan : l'ensemble doit rester sous la limite d'envoi de Discord."""
+    limit = getattr(guild, "filesize_limit", None)
+    limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else 10_000_000
+    return max(0, min(int(limit * 0.6), 8_000_000) - 400_000)
+
+def load_shot_uris(channel_ids, budget):
+    """Lit les captures (les plus recentes d'abord) jusqu'a epuisement du budget. Retourne ({salon: data URI}, nombre ignore)."""
+    uris, used, skipped = {}, 0, 0
+    for channel_id in channel_ids:
+        entry = (channel_shots().get(str(channel_id)) or {})
+        ext = entry.get("ext") or "webp"
+        if ext not in ("webp", "jpg"):
+            skipped += 1
+            continue
+        try:
+            with open(shot_file(channel_id, ext), "rb") as f:
+                data = f.read(SHOT_MAX_BYTES * 2 + 1)
+        except (OSError, ValueError):
+            skipped += 1   # fichier absent (volume non monte) : le bilan reste produit
+            continue
+        magic_ok = (data[:4] == b"RIFF" and data[8:12] == b"WEBP") if ext == "webp" else data[:3] == b"\xff\xd8\xff"
+        if not magic_ok or len(data) > SHOT_MAX_BYTES * 2:
+            skipped += 1
+            continue
+        encoded = base64.b64encode(data).decode()
+        if used + len(encoded) > budget:
+            skipped += 1
+            continue
+        used += len(encoded)
+        uris[str(channel_id)] = f"data:image/{'webp' if ext == 'webp' else 'jpeg'};base64,{encoded}"
+    return uris, skipped
+
+async def prepare_shots(channel_ids, budget):
+    """Captures du bilan. Ne leve JAMAIS : au pire, un bilan sans captures."""
+    if not channel_ids or budget <= 0:
+        return {}, len(channel_ids)
+    try:
+        return await asyncio.to_thread(load_shot_uris, list(channel_ids), budget)
+    except Exception as exc:
+        print(f"[CAPTURES] ignorees : {exc!r}")
+        return {}, len(channel_ids)
 
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
 # Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
@@ -2757,6 +3251,7 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
     save_data()
 
     await channel.send(embed=channel_welcome_embed())
+    await post_stock_prompt(channel, sessions[str(channel.id)])
     try:
         await post_attempt_panel(channel, sessions[str(channel.id)])
     except Exception as exc:  # confort : ne doit jamais empecher la creation du salon
@@ -2925,7 +3420,7 @@ def channel_welcome_embed():
         description=(
             "**Commandes**\n"
             "`/fmtotal` · total en cours\n"
-            "`/fmpay` · paiement du client (ex : `20M`), ou `-1M6` pour ajouter un stock apporté au total\n"
+            "`/fmpay` · paiement du client (ex : `20M`), ou `-1M6` pour ajouter un montant au total (stock à facturer)\n"
             "`/fmunpay` · annuler le dernier paiement\n"
             "`/fmpanel` · reposter le panneau de suivi des tentatives\n"
             "`/fmstats` · statistiques de tes tentatives (taux de réussite, rythme)\n"
@@ -2935,6 +3430,8 @@ def channel_welcome_embed():
             "`/fmundo` · annuler la dernière capture · `/fmadd` · ajouter une ligne à la main\n"
             "`/fmrune` · rune visée · `/fmtenta` · ajuster les tentatives (+20, -1)\n"
             "`/fmrecap` · récapitulatif de la commande à envoyer au client\n"
+            "`/fmstock` · stock de départ et stock restant (suivi séparé, jamais ajouté au montant à régler)\n"
+            "`/fmshot` · joindre la capture de l'équipement terminé (visible dans le bilan)\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -3005,6 +3502,7 @@ async def fmstart(interaction: discord.Interaction):
         "session-start", interaction.id, interaction.channel, interaction.created_at,
         author=site_author(interaction.user),
     ))
+    await post_stock_prompt(interaction.channel, sessions[channel_id])
     await sync_attempt_panel(interaction.channel, sessions[channel_id])
 
 @bot.tree.command(name="fmstop", description="Arreter la session et afficher le resume")
@@ -3024,7 +3522,7 @@ async def fmstop(interaction: discord.Interaction):
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk)
 
-    record_session_history(interaction.channel, session, "stop")
+    record = record_session_history(interaction.channel, session, "stop")
     del sessions[channel_id]
     touch_channel(channel_id)
     save_data()
@@ -3032,14 +3530,17 @@ async def fmstop(interaction: discord.Interaction):
         await send_rune_embeds(interaction.followup.send, runes)
     await send_event(site_event("session-stop", interaction.id, interaction.channel, interaction.created_at))
     await finalize_attempt_panel(interaction.channel, session)
+    if record is not None:   # stock restant : seulement si un stock de depart a ete declare
+        await post_stock_end_prompt(interaction.channel, record)
 
 @bot.tree.command(name="fmreset", description="Reinitialiser la session")
 async def fmreset(interaction: discord.Interaction):
     channel_id = str(interaction.channel.id)
     session = sessions.get(channel_id)
     if session is None or not session_has_activity(session):   # rien a perdre : pas de confirmation
-        await perform_reset(interaction, channel_id)
-        return await interaction.response.send_message("Session reinitialisee !")
+        reset_session_state(channel_id)
+        await interaction.response.send_message("Session reinitialisee !")
+        return await after_reset(interaction, channel_id)
 
     lines = sum(1 for _ in (session.get("runes") or {}))
     paiements = len(payments_of(session))
@@ -3083,7 +3584,7 @@ async def fmpay(interaction: discord.Interaction, montant: str, note: str = ""):
     if amount is None:
         return await interaction.response.send_message(
             f"Montant non compris : « {montant} ». Exemples : `20000000`, `20 000 000`, `20M`, "
-            "`20kk`, `1.5M`, `500k`, `1M6` (= 1,6 million), ou `-1M6` pour ajouter un stock apporté "
+            "`20kk`, `1.5M`, `500k`, `1M6` (= 1,6 million), ou `-1M6` pour ajouter un montant "
             "au total. Rien n'a été enregistré.", ephemeral=True)
 
     entry = {"amount": amount, "by": str(interaction.user.id), "at": now_iso()}
@@ -3260,6 +3761,55 @@ async def fmtenta(interaction: discord.Interaction, nombre: str, issue: str = No
     if applied > 0:
         text += "\nAjoutées en bloc : comptées, mais sans effet sur le calcul du rythme."
     await interaction.response.send_message(text)
+
+@bot.tree.command(name="fmstock", description="Renseigner ou corriger le stock de départ et le stock restant (suivi séparé des paiements)")
+@app_commands.describe(
+    depart="Valeur du stock au départ (ex : 1M6) ; « aucun » pour l'effacer",
+    restant="Valeur du stock restant (ex : 500k) ; « aucun » = plus rien en stock",
+    salon="Salon concerné (par défaut : celui-ci, même archivé)",
+)
+async def fmstock(interaction: discord.Interaction, depart: str = "", restant: str = "", salon: discord.TextChannel = None):
+    target = salon or interaction.channel
+    target_id = str(target.id)
+    if not can_tag_channel(interaction.user, target_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut modifier le stock.", ephemeral=True)
+    if not (depart or "").strip() and not (restant or "").strip():
+        return await interaction.response.send_message(
+            "Indique `depart` et/ou `restant` : `/fmstock depart:20M`, `/fmstock restant:5M`. Le stock est un suivi à part : "
+            "il n'entre jamais dans le montant à régler.", ephemeral=True)
+    elsewhere = target_id != str(interaction.channel.id)
+
+    live = sessions.get(target_id)
+    if live is not None:
+        holder, purchases, label = live, live["total"], "session en cours"
+    else:
+        past = [r for r in fm_state().get("history", []) if r.get("ch") == target_id]
+        if not past:
+            return await interaction.response.send_message("Aucune session (en cours ou terminée) dans ce salon.", ephemeral=True)
+        holder = max(past, key=lambda r: r.get("end") or "")
+        purchases, label = holder.get("total", 0), "dernière session terminée"
+
+    # Les deux valeurs sont lues AVANT toute ecriture : une saisie illisible ne modifie rien.
+    updates = {}
+    for field, name, raw in (("start", "depart", depart), ("end", "restant", restant)):
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        if raw.lower() in STOCK_NONE_WORDS:
+            updates[field] = None if field == "start" else 0   # départ « aucun » = effacé ; restant « aucun » = plus rien
+            continue
+        value = parse_kamas_amount(raw)
+        if value is None:
+            return await interaction.response.send_message(
+                f"`{name}` non compris (ou trop grand) : « {raw} ». Exemples : `1M6`, `2 450 000`, `500k`. Rien n'a été modifié.", ephemeral=True)
+        updates[field] = value
+    for field, value in updates.items():
+        set_stock(holder, field, value)
+    touch_channel(target_id)
+    save_data()
+    lines = stock_summary_lines(stock_of(holder), purchases) or ["Aucun stock déclaré pour cette session."]
+    await interaction.response.send_message(f"📦 Stock mis à jour ({label}) :\n" + "\n".join(lines), ephemeral=elsewhere)
 
 @bot.tree.command(name="fmpanel", description="Poster (ou recréer) le panneau de suivi des tentatives")
 async def fmpanel(interaction: discord.Interaction):
@@ -3470,6 +4020,72 @@ async def fmrecap(interaction: discord.Interaction, client: str = "", salon: dis
         file=discord.File(BytesIO(page.encode("utf-8")), filename=f"recap-{slug}-{recap['when'].strftime('%Y-%m-%d')}.html"),
         ephemeral=True)
 
+@bot.tree.command(name="fmshot", description="Joindre la capture de l'équipement terminé à ce salon (visible dans le bilan)")
+@app_commands.describe(
+    image="Capture d'écran de l'équipement terminé (PNG, JPEG ou WebP)",
+    salon="Salon concerné (par défaut : celui-ci, même archivé)",
+    retirer="Supprimer la capture déjà enregistrée pour ce salon",
+)
+async def fmshot(interaction: discord.Interaction, image: discord.Attachment = None, salon: discord.TextChannel = None, retirer: bool = False):
+    target = salon or interaction.channel
+    target_id = str(target.id)
+    if not can_tag_channel(interaction.user, target_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut joindre une capture.", ephemeral=True)
+    elsewhere = target_id != str(interaction.channel.id)
+
+    if retirer:
+        existed = channel_shots().pop(target_id, None) is not None
+        removed = remove_shot(target_id)
+        if existed:
+            save_data()
+        return await interaction.response.send_message(
+            "Capture retirée du salon." if (existed or removed) else "Aucune capture n'était enregistrée pour ce salon.", ephemeral=elsewhere)
+    if image is None:
+        return await interaction.response.send_message(
+            "Joins la capture de l'équipement terminé dans l'option `image` de la commande.", ephemeral=True)
+    content_type = (getattr(image, "content_type", None) or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        return await interaction.response.send_message("Ce fichier n'est pas une image : envoie une capture PNG, JPEG ou WebP.", ephemeral=True)
+    if isinstance(getattr(image, "size", None), int) and image.size > SHOT_MAX_INPUT:
+        return await interaction.response.send_message("Image trop lourde (8 Mo au maximum).", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=elsewhere)
+    try:
+        raw = await image.read()
+        info = await asyncio.to_thread(encode_shot, raw)
+        await asyncio.to_thread(save_shot, target_id, info)
+    except ShotError as exc:
+        return await interaction.followup.send(f"Capture refusée : {exc}", ephemeral=True)
+    except Exception as exc:
+        print(f"[CAPTURES] /fmshot a echoue : {exc!r}")
+        return await interaction.followup.send("Erreur pendant l'enregistrement de la capture : le détail est dans les logs du bot.", ephemeral=True)
+    channel_shots()[target_id] = {"ext": info["ext"], "w": info["w"], "h": info["h"], "bytes": len(info["data"]),
+                                  "by": str(interaction.user.id), "at": now_iso()}
+    touch_channel(target_id)
+    save_data()
+
+    text = (f"📸 Capture de l'équipement terminé enregistrée pour <#{target_id}> "
+            f"({info['w']}×{info['h']}, {len(info['data']) // 1024 or 1} Ko). Elle s'affichera au survol de l'équipement dans le bilan.")
+    if target_id not in channel_items():
+        text += "\nAstuce : `/fmitem` associe aussi l'équipement (icône et nom), que la capture illustrera."
+    if await asyncio.to_thread(shots_dir_ephemeral):
+        text += "\n" + EPHEMERAL_SHOT_WARNING
+
+    def build_embed():
+        embed = discord.Embed(title="Équipement terminé", description=f"Capture ajoutée par <@{interaction.user.id}>.", color=discord.Color.blurple())
+        embed.set_image(url=f"attachment://equipement.{info['ext']}")
+        return embed
+    def build_file():
+        return discord.File(BytesIO(info["data"]), filename=f"equipement.{info['ext']}")
+
+    await interaction.followup.send(content=text, embed=build_embed(), file=build_file())
+    if elsewhere:   # le salon cible (peut-etre archive) garde une trace visible
+        try:
+            await target.send(embed=build_embed(), file=build_file())
+        except discord.HTTPException as exc:
+            print(f"[CAPTURES] message non poste dans #{getattr(target, 'name', '?')} : {exc}")
+
 @bot.tree.command(name="fmbilan", description="Page de bilan : chronologie des sessions et totaux par mois, trimestre, année")
 @app_commands.describe(
     periode="Période détaillée dans la chronologie (mois par défaut)",
@@ -3529,7 +4145,20 @@ async def fmbilan(interaction: discord.Interaction, periode: str = "mois", reper
             print(f"[RUNES] galerie ignoree : {exc!r}")
     report["items_in_use"] = bool(linked_items)
     item_icons = await prepare_item_icons(report)
-    page = render_report_html(report, owner_name_of, runes, item_icons)
+    shot_meta = channel_shots()
+    wanted = []
+    for _when, rr in sorted(report["timeline"], key=lambda x: x[0], reverse=True):   # les plus recentes d'abord
+        ch = str(rr.get("ch"))
+        if ch in shot_meta and ch not in wanted:
+            wanted.append(ch)
+    shots, skipped = await prepare_shots(wanted, shot_budget(interaction.guild))
+    report["shots_skipped"] = skipped
+    page = render_report_html(report, owner_name_of, runes, item_icons, shots)
+    limit = getattr(interaction.guild, "filesize_limit", None)
+    limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else 10_000_000
+    if shots and len(page.encode("utf-8")) > int(limit * 0.95):   # garde-fou : un fichier refuse par Discord ne sert a rien
+        report["shots_skipped"] = len(wanted)
+        page = render_report_html(report, owner_name_of, runes, item_icons, None)
     p = report["period"]
     summary = (f"**{label}** : {p['n']} session(s) · dépensé {format_number(p['total'])} · "
                f"facturé {format_number(p['total'] + p['adjust'])} · acomptes {format_number(p['paid'])} kamas")
@@ -3646,6 +4275,7 @@ async def poll_site():
                         f"Session FM demarree depuis le site par {player.get('displayName', 'un joueur')}"
                         + (f" ({item['name']})" if item else "")
                     )
+                    await post_stock_prompt(channel, sessions[str(channel.id)])
                     await sync_attempt_panel(channel, sessions[str(channel.id)])
                 elif command["type"] == "close" and channel is not None:
                     await close_session_in_channel(channel)
@@ -3704,12 +4334,17 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 async def setup_hook():
     bot.add_view(NewSessionView())
     bot.add_view(AttemptPanelView())
+    bot.add_view(StockPromptView())
+    bot.add_view(StockEndPromptView())
 
 @bot.event
 async def on_ready():
     load_data()
+    migrate_stock_adjustments()
     await sync_commands()
     print(f"Bot connecte en tant que {bot.user} (version {BOT_VERSION})")
+    if shots_dir_ephemeral():
+        print(f"[CAPTURES] ATTENTION : {SHOT_DIR} n'est pas un volume Docker, les captures d'equipement seront perdues a la prochaine mise a jour.")
     if FM_PERSONAL_CHANNELS:
         await ensure_button_emoji()
         for guild in bot.guilds:

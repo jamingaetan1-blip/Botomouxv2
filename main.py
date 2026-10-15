@@ -6,6 +6,7 @@ from PIL import Image, ImageOps, ImageStat
 import requests
 from io import BytesIO
 import asyncio
+import base64
 import datetime
 import html as html_lib
 import math
@@ -1158,10 +1159,204 @@ def build_report(records, tz, start, end, label, now, player_label=None, sample=
     return {
         "label": label, "start": start, "end": end, "tz": tz, "now": now, "player": player_label,
         "sample": sample, "timeline": timeline, "period": period, "players": players,
-        "top_items": sorted(items.items(), key=lambda kv: -kv[1][1])[:5],
+        "top_items": sorted(items.items(), key=lambda kv: -kv[1][1])[:5], "items_all": items,
         "by_month": by_month, "by_quarter": by_quarter, "by_year": by_year, "chart": chart,
         "first": dated[0][0] if dated else None, "undated": undated,
     }
+
+# ---------------- BILAN : IMAGES DES RUNES (DOFUSDB) ----------------
+# Les images viennent de l'API publique de DofusDB (non officielle). Pour la menager : la liste des runes
+# est lue une fois puis gardee une semaine, chaque image n'est telechargee qu'une fois (cache disque), les
+# requetes sont espacees et un budget de temps borne l'ensemble. Les images sont ensuite INTEGREES dans la
+# page (base64) : le fichier reste autonome. Si DofusDB est injoignable, la page est produite sans images.
+RUNE_IMAGES_ENABLED = os.environ.get("FM_RUNE_IMAGES", "1") != "0"
+DOFUSDB_API = "https://api.dofusdb.fr"
+DOFUSDB_IMG_PREFIX = DOFUSDB_API + "/img/items/"
+RUNE_TYPE_ID = 78                      # « Rune de forgemagie » (types=78 sur dofusdb.fr)
+RUNE_CATALOG_MAX_AGE = 7 * 86400       # on relit la liste des runes au plus une fois par semaine
+RUNE_RETRY_AFTER = 1800                # apres un echec (ou sans liste), on attend 30 min avant de reessayer
+RUNE_MISSING_RETRY_AFTER = 6 * 3600    # une rune absente de la liste : on relit la liste au plus toutes les 6 h
+RUNE_FETCH_BUDGET = 40                 # secondes au maximum pour toutes les requetes d'un bilan
+RUNE_CACHE_DIR = os.environ.get("RUNE_CACHE_DIR") or os.path.join(os.path.dirname(DATA_PATH) or ".", "rune_cache")
+DOFUSDB_HEADERS = {"User-Agent": "Botomoux-FM/1.0 (bot Discord prive, usage non commercial)", "Accept": "application/json"}
+ICON_MAX_BYTES = 300_000
+ICON_MAX_PIXELS = 4_000_000
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+def rune_key(name):
+    """Nom compare sans casse, sans accents, espaces normalises : « Rune Ré Per Feu » = « rune re per feu »."""
+    return re.sub(r"\s+", " ", _norm(name))
+
+def _http_get(http, url, params, deadline):
+    """GET avec delai maximal, budget de temps global, et une nouvelle tentative apres un 429 (trop de requetes)."""
+    response = None
+    for _attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("budget de temps epuise")
+        response = http.get(url, params=params, timeout=max(1, min(8, remaining)))
+        if response.status_code != 429:
+            return response
+        try:
+            wait = float(response.headers.get("Retry-After", 2))
+        except (TypeError, ValueError):
+            wait = 2
+        time.sleep(min(max(wait, 1), 5))
+    return response
+
+def fetch_rune_catalog(http, deadline):
+    """Toutes les runes de forgemagie : {cle normalisee: {"name": nom FR, "img": adresse de l'image}}."""
+    catalog, skip, total, use_limit, pages = {}, 0, None, True, 0
+    while (total is None or skip < total) and pages < 100:
+        params = {"typeId[$in][]": RUNE_TYPE_ID, "$sort": "-id", "$skip": skip}
+        if use_limit:
+            params["$limit"] = 50
+        response = _http_get(http, f"{DOFUSDB_API}/items", params, deadline)
+        if response.status_code == 400 and use_limit and pages == 0:
+            use_limit = False   # l'API n'accepte pas $limit : on se contente de sa taille de page par defaut
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list) or not data:
+            break
+        if isinstance(payload.get("total"), int):
+            total = payload["total"]
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), dict):
+                continue
+            name, img = item["name"].get("fr"), item.get("img")
+            # L'adresse de l'image n'est suivie que si elle pointe bien vers DofusDB.
+            if isinstance(name, str) and name.strip() and isinstance(img, str) and img.startswith(DOFUSDB_IMG_PREFIX):
+                catalog[rune_key(name)] = {"name": name.strip(), "img": img}
+        skip += len(data)
+        pages += 1
+        time.sleep(0.25)
+    return catalog
+
+def fetch_rune_icon(http, img_url, deadline):
+    """Icone en PNG (64 px max, octets) : cache disque d'abord, DofusDB sinon. None si indisponible ou suspecte."""
+    if not isinstance(img_url, str) or not img_url.startswith(DOFUSDB_IMG_PREFIX):
+        return None
+    match = re.fullmatch(r"(\d{1,9})\.png", img_url[len(DOFUSDB_IMG_PREFIX):])
+    if not match:
+        return None
+    path = os.path.join(RUNE_CACHE_DIR, match.group(1) + ".png")
+    try:
+        with open(path, "rb") as f:
+            cached = f.read()
+        if cached[:8] == PNG_MAGIC:
+            return cached
+    except OSError:
+        pass
+    response = _http_get(http, img_url, None, deadline)
+    if response.status_code != 200 or len(response.content) > ICON_MAX_BYTES:
+        return None
+    try:
+        image = Image.open(BytesIO(response.content))
+        if image.width * image.height > ICON_MAX_PIXELS:
+            return None
+        image.load()
+        image = image.convert("RGBA")
+        image.thumbnail((64, 64), Image.LANCZOS)
+        out = BytesIO()
+        image.save(out, "PNG", optimize=True)
+        data = out.getvalue()
+    except Exception:
+        return None   # pas une image valide : jamais integree telle quelle
+    try:
+        os.makedirs(RUNE_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return data
+
+def load_rune_icons(wanted_keys, catalog, fetched_at, tried_at, now_ts, budget=RUNE_FETCH_BUDGET):
+    """
+    Travail reseau, a lancer dans un thread (il ne touche pas a l'etat du bot, tout lui est passe en
+    parametre). Retourne {"catalog", "fetched_at", "tried_at", "icons": {cle: octets PNG}, "notes": [...]}.
+    """
+    result = {"catalog": dict(catalog or {}), "fetched_at": fetched_at, "tried_at": tried_at, "icons": {}, "notes": []}
+    deadline = time.monotonic() + budget
+    http = requests.Session()
+    http.headers.update(DOFUSDB_HEADERS)
+
+    missing = any(k.startswith("rune") and k not in result["catalog"] for k in wanted_keys)
+    if not result["catalog"] or fetched_at is None or now_ts - fetched_at > RUNE_CATALOG_MAX_AGE:
+        need, delay = True, RUNE_RETRY_AFTER
+    elif missing:
+        need, delay = True, RUNE_MISSING_RETRY_AFTER
+    else:
+        need, delay = False, 0
+    if need and (tried_at is None or now_ts - tried_at >= delay):
+        result["tried_at"] = now_ts
+        try:
+            fresh = fetch_rune_catalog(http, deadline)
+            if fresh and any(v["name"].lower().startswith("rune") for v in fresh.values()):
+                result["catalog"], result["fetched_at"] = fresh, now_ts
+            else:
+                result["notes"].append("la liste de runes reçue de DofusDB est vide ou inattendue")
+        except Exception as exc:
+            result["notes"].append(f"DofusDB injoignable ({type(exc).__name__})")
+    elif need and not result["catalog"]:
+        result["notes"].append("DofusDB était injoignable récemment : nouvelle tentative dans quelques minutes")
+
+    for key in wanted_keys:
+        entry = result["catalog"].get(key)
+        if not entry:
+            continue
+        try:
+            icon = fetch_rune_icon(http, entry["img"], deadline)
+        except Exception as exc:   # reseau coupe, budget epuise... : inutile d'insister sur les suivantes
+            result["notes"].append(f"images interrompues ({type(exc).__name__})")
+            break
+        if icon:
+            result["icons"][key] = icon
+    return result
+
+async def prepare_rune_gallery(items):
+    """Prepare les images pour les objets d'un bilan. Ne leve JAMAIS : au pire, pas d'images."""
+    state = fm_state()
+    known = dict(state.get("rune_catalog") or {})
+    empty = {"catalog": known, "icons": {}, "notes": []}
+    if not RUNE_IMAGES_ENABLED or not items:
+        return empty
+    try:
+        keys = {rune_key(name) for name in items}
+        res = await asyncio.to_thread(load_rune_icons, keys, known, state.get("rune_catalog_at"),
+                                      state.get("rune_catalog_tried"), time.time())
+    except Exception as exc:
+        print(f"[RUNES] images indisponibles : {exc!r}")
+        return {**empty, "notes": ["images indisponibles"]}
+    state["rune_catalog"], state["rune_catalog_at"], state["rune_catalog_tried"] = res["catalog"], res["fetched_at"], res["tried_at"]
+    save_data()
+    icons = {key: "data:image/png;base64," + base64.b64encode(raw).decode() for key, raw in res["icons"].items()}
+    return {"catalog": res["catalog"], "icons": icons, "notes": res["notes"]}
+
+def build_rune_rows(items, gallery):
+    """
+    Lignes de la galerie : les objets de la periode qui sont des runes connues de DofusDB, plus les noms
+    « Rune … » absents de la liste (souvent une faute de lecture de la capture, a verifier).
+    """
+    catalog, icons = gallery["catalog"], gallery["icons"]
+    merged = {}
+    for name, (qty, price) in items.items():
+        key = rune_key(name)
+        entry = catalog.get(key)
+        if entry:
+            status = "ok"
+        elif key.startswith("rune"):
+            status = "unknown" if catalog else "nocatalog"
+        else:
+            continue   # ressource (Pepite...) : pas une rune
+        row = merged.setdefault(key, {"name": entry["name"] if entry else name, "qty": 0, "price": 0,
+                                      "icon": icons.get(key), "status": status})
+        row["qty"] += qty
+        row["price"] += price
+    return sorted(merged.values(), key=lambda r: -r["price"])
 
 # ---------------- BILAN : PAGE HTML ---------------- #
 # Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
@@ -1217,8 +1412,49 @@ tr.sel td{background:var(--accent-soft)}
 .notes{color:var(--muted);font-size:.85rem;margin-top:36px}
 .notes li{margin:3px 0}
 .empty{color:var(--muted);padding:18px;border:1px dashed var(--line);border-radius:12px}
-@media print{body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
+th[data-sort]:not([data-sort="none"]){cursor:pointer;user-select:none}
+th[data-sort]:not([data-sort="none"]):hover{color:var(--text)}
+th:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+th[aria-sort=ascending]::after{content:" ▲";font-size:.7em}
+th[aria-sort=descending]::after{content:" ▼";font-size:.7em}
+.hint{color:var(--muted);font-size:.85rem;margin:-4px 0 10px}
+.ico{width:36px;height:36px;object-fit:contain;vertical-align:middle}
+.ph{display:inline-flex;align-items:center;justify-content:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:.85rem}
+.rname{display:flex;align-items:center;gap:10px;text-align:left}
+.warn{color:var(--warn)}
+@media print{.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
 """
+
+REPORT_JS = """(function(){
+function num(v){var n=parseFloat(v);return isNaN(n)?0:n}
+var tables=document.querySelectorAll('table.sortable');
+Array.prototype.forEach.call(tables,function(table){
+ var body=table.tBodies[0],heads=table.tHead.rows[0].cells;
+ Array.prototype.forEach.call(heads,function(th,col){
+  var type=th.getAttribute('data-sort');
+  if(!type||type==='none')return;
+  th.tabIndex=0;
+  function go(){
+   var cur=th.getAttribute('aria-sort');
+   var asc=cur?cur==='descending':type==='text';
+   var rows=Array.prototype.slice.call(body.rows);
+   rows.forEach(function(r,i){r._i=i});
+   rows.sort(function(a,b){
+    var x=a.cells[col].getAttribute('data-v')||'',y=b.cells[col].getAttribute('data-v')||'';
+    var c=type==='text'?x.localeCompare(y,'fr',{numeric:true,sensitivity:'base'}):num(x)-num(y);
+    return c!==0?(asc?c:-c):a._i-b._i;
+   });
+   rows.forEach(function(r){body.appendChild(r)});
+   Array.prototype.forEach.call(heads,function(h){h.removeAttribute('aria-sort')});
+   th.setAttribute('aria-sort',asc?'ascending':'descending');
+  }
+  th.addEventListener('click',go);
+  th.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}});
+ });
+});
+})();"""
+# Seul ce script exact pourra s'executer : sa valeur de hachage figure dans la politique de securite.
+REPORT_JS_HASH = "sha256-" + base64.b64encode(hashlib.sha256(REPORT_JS.encode("utf-8")).digest()).decode()
 
 def _kamas_short(n):
     """Montant abrege pour le graphique : 193 450 000 -> « 193,5 M ». Arrondi decimal (jamais flottant)."""
@@ -1234,7 +1470,7 @@ def _kamas_short(n):
         return sign + f"{value:f}".rstrip("0").rstrip(".").replace(".", ",") + unit
     return f"{sign}{n}"
 
-def render_report_html(report, owner_name_of):
+def render_report_html(report, owner_name_of, runes=None):
     esc = html_lib.escape
     tz, start, end = report["tz"], report["start"], report["end"]
     period = report["period"]
@@ -1247,18 +1483,29 @@ def render_report_html(report, owner_name_of):
         return f"{agg['target'] * 100 / agg['tries']:.0f} %" if agg["tries"] else "—"
 
     def agg_cells(agg):
-        return [str(agg["n"]), amount(agg["total"]), amount(agg["adjust"]), amount(agg["total"] + agg["adjust"]),
-                amount(agg["paid"]), str(agg["tries"]), f"{agg['target']} ({rate(agg)})" if agg["tries"] else "—"]
+        """Cellules (affichage, valeur brute de tri) d'un agregat."""
+        billed = agg["total"] + agg["adjust"]
+        rate_value = agg["target"] * 100 / agg["tries"] if agg["tries"] else -1
+        return [(str(agg["n"]), agg["n"]), (amount(agg["total"]), agg["total"]),
+                (amount(agg["adjust"]), agg["adjust"]), (amount(billed), billed),
+                (amount(agg["paid"]), agg["paid"]), (str(agg["tries"]), agg["tries"]),
+                (f"{agg['target']} ({rate(agg)})" if agg["tries"] else "—", rate_value)]
 
-    headers = ["Sessions", "Dépensé", "Stock ajouté", "Facturé", "Payé", "Tentatives", target_label]
+    agg_heads = [("Sessions", "num", ""), ("Dépensé", "num", ""), ("Stock ajouté", "num", ""), ("Facturé", "num", ""),
+                 ("Payé", "num", ""), ("Tentatives", "num", ""), (target_label, "num", "Tri sur le taux de réussite")]
 
-    def table(first_header, rows):
-        head = "".join(f"<th>{esc(h)}</th>" for h in [first_header] + headers)
-        body = "".join(
-            ('<tr class="sel">' if sel else "<tr>")
-            + f"<td>{esc(label)}</td>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
-            for label, cells, sel in rows)
-        return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+    def sortable_table(head_specs, rows):
+        """head_specs : [(libelle, num|text|none, infobulle)] ; rows : [(cellules[(html, valeur)], en_surbrillance)]."""
+        heads = ""
+        for label, kind, tip in head_specs:
+            title = f' title="{esc(tip)}"' if tip else ""
+            heads += f'<th data-sort="{kind}"{title}>{esc(label)}</th>'
+        body = ""
+        for cells, selected in rows:
+            tds = "".join(f'<td data-v="{esc(str(value))}">{shown}</td>' for shown, value in cells)
+            body += ('<tr class="sel">' if selected else "<tr>") + tds + "</tr>"
+        return (f'<div class="scroll"><table class="sortable"><thead><tr>{heads}</tr></thead>'
+                f"<tbody>{body}</tbody></table></div>")
 
     # ---- en-tete ----
     parts = [f'<h1>Bilan FM · {esc(report["label"])}</h1>']
@@ -1353,29 +1600,61 @@ def render_report_html(report, owner_name_of):
         a, b = _period_bounds(kind, key, tz)
         return start is not None and _overlaps(start, end, a, b)
 
-    for title, first_header, kind, data, label_fn in (
-            ("Par mois", "Mois", "month", report["by_month"], lambda k: f"{MONTHS_FR[k[1] - 1].capitalize()} {k[0]}"),
-            ("Par trimestre", "Trimestre", "quarter", report["by_quarter"], lambda k: f"T{k[1]} {k[0]}"),
-            ("Par année", "Année", "year", report["by_year"], lambda k: str(k))):
+    parts.append('<p class="hint">Clique sur un en-tête de colonne pour trier un tableau (un second clic inverse le tri).</p>')
+    for title, first_header, kind, data, label_fn, order_fn in (
+            ("Par mois", "Mois", "month", report["by_month"],
+             lambda k: f"{MONTHS_FR[k[1] - 1].capitalize()} {k[0]}", lambda k: k[0] * 100 + k[1]),
+            ("Par trimestre", "Trimestre", "quarter", report["by_quarter"],
+             lambda k: f"T{k[1]} {k[0]}", lambda k: k[0] * 10 + k[1]),
+            ("Par année", "Année", "year", report["by_year"], lambda k: str(k), lambda k: k)):
         parts.append(f"<h2>{title}</h2>")
         if not data:
             parts.append('<div class="empty">Aucune donnée.</div>')
             continue
-        rows = [(label_fn(k), agg_cells(data[k]), sel(kind, k)) for k in sorted(data, reverse=True)]
-        parts.append(table(first_header, rows))
+        rows = [([(esc(label_fn(k)), order_fn(k))] + agg_cells(data[k]), sel(kind, k)) for k in sorted(data, reverse=True)]
+        parts.append(sortable_table([(first_header, "num", "Tri chronologique")] + agg_heads, rows))
 
     # ---- par joueur / objets ----
     if len(report["players"]) > 1:
         parts.append("<h2>Par joueur (période affichée)</h2>")
         ordered = sorted(report["players"].items(), key=lambda kv: -(kv[1]["total"] + kv[1]["adjust"]))
-        parts.append(table("Joueur", [
-            ((owner_name_of(o) if o else "(salon sans propriétaire)"), agg_cells(a), False) for o, a in ordered]))
+        rows = []
+        for owner, agg in ordered:
+            name = owner_name_of(owner) if owner else "(salon sans propriétaire)"
+            rows.append(([(esc(name), name)] + agg_cells(agg), False))
+        parts.append(sortable_table([("Joueur", "text", "")] + agg_heads, rows))
     if report["top_items"]:
         parts.append("<h2>Objets les plus dépensés (période affichée)</h2>")
-        body = "".join(f"<tr><td>{esc(name)}</td><td>{format_number(qty)}</td><td>{amount(price)}</td></tr>"
-                       for name, (qty, price) in report["top_items"])
-        parts.append('<div class="scroll"><table><thead><tr><th>Objet</th><th>Quantité</th><th>Dépensé</th></tr></thead>'
-                     f"<tbody>{body}</tbody></table></div>")
+        rows = [([(esc(name), name), (format_number(qty), qty), (amount(price), price)], False)
+                for name, (qty, price) in report["top_items"]]
+        parts.append(sortable_table([("Objet", "text", ""), ("Quantité", "num", ""), ("Dépensé", "num", "")], rows))
+
+    # ---- galerie des runes (a la fin) ----
+    gallery_notes = []
+    if runes and runes.get("rows"):
+        parts.append("<h2>Runes achetées (période affichée)</h2>")
+        rows = []
+        for r in runes["rows"]:
+            if r["icon"]:
+                icon = f'<img class="ico" alt="" src="{r["icon"]}" width="36" height="36">'
+            else:
+                icon = '<span class="ico ph" title="Image indisponible">?</span>'
+            flag = ' <span class="badge del">nom inconnu de DofusDB</span>' if r["status"] == "unknown" else ""
+            average = int((Decimal(r["price"]) / Decimal(r["qty"])).quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if r["qty"] else 0
+            rows.append(([(f'<span class="rname">{icon}<span>{esc(r["name"])}{flag}</span></span>', r["name"]),
+                          (format_number(r["qty"]), r["qty"]), (amount(r["price"]), r["price"]),
+                          (amount(average), average)], False))
+        parts.append(sortable_table([("Rune", "text", ""), ("Quantité", "num", ""), ("Dépensé", "num", ""),
+                                     ("Prix moyen / unité", "num", "Dépensé ÷ quantité")], rows))
+        if report["sample"]:
+            gallery_notes.append("Images d'exemple (pictogrammes fictifs) : dans un vrai bilan, ce sont les illustrations "
+                                 "des runes fournies par DofusDB.")
+        else:
+            gallery_notes.append("Images des runes : DofusDB (illustrations © Ankama), chargées à la demande puis conservées en cache.")
+        if any(r["status"] == "unknown" for r in runes["rows"]):
+            gallery_notes.append("Une rune marquée « nom inconnu de DofusDB » ne correspond à aucune rune connue : "
+                                 "c'est souvent une faute de lecture de la capture, à vérifier.")
+        gallery_notes.extend(esc(f"Images : {n}.") for n in (runes.get("notes") or []))
 
     # ---- notes ----
     first = report["first"].strftime("%d/%m/%Y") if report["first"] else "—"
@@ -1384,15 +1663,17 @@ def render_report_html(report, owner_name_of):
              "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Payé = paiements enregistrés "
              "pendant la session : un règlement fait après la fermeture n'est pas connu du bot.",
              f"Mois, trimestres et années sont lus en heure de {esc(str(tz))}."]
+    notes.extend(gallery_notes)
     if report["undated"]:
         notes.append(f"{report['undated']} session(s) sans date lisible n'apparaissent pas dans la chronologie ni dans les totaux.")
     parts.append('<ul class="notes">' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>")
 
     return ("<!DOCTYPE html>\n<html lang=\"fr\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\">"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; "
+            f"img-src data:; script-src '{REPORT_JS_HASH}'\">"
             f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}</style></head><body><main>"
-            + "".join(parts) + "</main></body></html>")
+            + "".join(parts) + f"</main><script>{REPORT_JS}</script></body></html>")
 
 # ---------------- SUIVI DES TENTATIVES DE FM ---------------- #
 # Un panneau a boutons, epingle dans le salon : un clic = une tentative. Les compteurs sont ranges
@@ -2333,7 +2614,14 @@ async def fmbilan(interaction: discord.Interaction, periode: str = "mois", reper
 
     report = build_report(records, tz, start, end, label, now,
                           player_label=joueur.display_name if joueur else None)
-    page = render_report_html(report, owner_name_of)
+    runes = None   # option desactivee (FM_RUNE_IMAGES=0) : aucune galerie
+    if RUNE_IMAGES_ENABLED:
+        try:
+            gallery = await prepare_rune_gallery(report["items_all"])
+            runes = {"rows": build_rune_rows(report["items_all"], gallery), "notes": gallery["notes"]}
+        except Exception as exc:   # le bilan prime : sans images plutot que pas de bilan
+            print(f"[RUNES] galerie ignoree : {exc!r}")
+    page = render_report_html(report, owner_name_of, runes)
     p = report["period"]
     summary = (f"**{label}** : {p['n']} session(s) · dépensé {format_number(p['total'])} · "
                f"facturé {format_number(p['total'] + p['adjust'])} · payé {format_number(p['paid'])} kamas")

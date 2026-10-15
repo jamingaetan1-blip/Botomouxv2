@@ -1131,9 +1131,17 @@ def build_report(records, tz, start, end, label, now, player_label=None, sample=
     timeline = [(w, r) for w, r in dated if start is None or start <= w < end]
 
     period, players, items = _new_agg(), {}, {}
+    by_item, unlinked = {}, []
     for _w, r in timeline:
         _add_agg(period, r)
         _add_agg(players.setdefault(r.get("owner"), _new_agg()), r)
+        item = r.get("item")   # equipement associe au salon par /fmitem (ajoute par la commande, jamais stocke)
+        if item:
+            _add_agg(by_item.setdefault(item["id"], {"item": item, "agg": _new_agg()})["agg"], r)
+        else:
+            room = r.get("name") or "salon"
+            if room not in unlinked:
+                unlinked.append(room)
         for name, (qty, price) in (r.get("items") or {}).items():
             cur = items.setdefault(name, [0, 0])
             cur[0] += qty
@@ -1160,6 +1168,7 @@ def build_report(records, tz, start, end, label, now, player_label=None, sample=
         "label": label, "start": start, "end": end, "tz": tz, "now": now, "player": player_label,
         "sample": sample, "timeline": timeline, "period": period, "players": players,
         "top_items": sorted(items.items(), key=lambda kv: -kv[1][1])[:5], "items_all": items,
+        "by_item": by_item, "unlinked": unlinked, "items_in_use": False,
         "by_month": by_month, "by_quarter": by_quarter, "by_year": by_year, "chart": chart,
         "first": dated[0][0] if dated else None, "undated": undated,
     }
@@ -1358,6 +1367,183 @@ def build_rune_rows(items, gallery):
         row["price"] += price
     return sorted(merged.values(), key=lambda r: -r["price"])
 
+# ---------------- EQUIPEMENTS (DOFUSDB) : /fmitem ----------------
+# /fmitem associe un equipement a un salon (meme archive). Son icone et son nom apparaissent ensuite dans
+# le bilan. L'objet est cherche sur DofusDB a la demande (quelques requetes, jamais tout le catalogue : des
+# milliers d'objets de ~15 Ko), puis garde en cache. Trois formes acceptees : le nom (« Anneau de Padgref »),
+# l'identifiant DofusDB (34329) ou l'adresse de la fiche. Un resultat n'est accepte que si son nom correspond
+# VRAIMENT a la demande : si l'API ignorait un filtre et renvoyait n'importe quoi, on refuse au lieu de
+# lier le mauvais objet.
+EQUIPMENT_TYPE_IDS = [1, 9, 2, 3, 4, 5, 6, 7, 8, 19, 21, 22, 271, 11, 82, 17, 10, 16]   # types de l'adresse dofusdb.fr
+ITEM_LOOKUP_BUDGET = 25
+ITEM_REMOVE_WORDS = {"aucun", "aucune", "retirer", "supprimer", "effacer", "none", "-"}
+
+class ItemLookupError(Exception):
+    """kind : badref (reference illisible) | notfound | network (DofusDB injoignable ou refuse)."""
+    def __init__(self, kind, detail=""):
+        super().__init__(f"{kind}: {detail}")
+        self.kind, self.detail = kind, detail
+
+def item_key(name):
+    """Nom compare sans casse, sans accents, apostrophes typographiques unifiees (« L’Épée » = « l'epee »)."""
+    text = (name or "").replace("\u2019", "'").replace("\u2018", "'").replace("\u02bc", "'")
+    return re.sub(r"\s+", " ", _norm(text))
+
+def parse_item_reference(text):
+    """("id", 34329) | ("name", "Anneau de Padgref") | (None, None) si la reference est inutilisable."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+    if re.fullmatch(r"\d{1,9}", raw):
+        return "id", int(raw)
+    match = re.search(r"dofusdb\.fr/.+?/(\d{1,9})(?:[/?#].*)?$", raw)   # .../database/object/34329
+    if match:
+        return "id", int(match.group(1))
+    if re.match(r"https?://", raw, re.IGNORECASE):
+        return None, None   # une adresse qui n'est pas une fiche d'objet
+    return "name", raw
+
+def item_from_doc(doc):
+    """{id, name, img, type, type_name, level} d'une fiche DofusDB, ou None si elle est inexploitable."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("id"), int) or isinstance(doc.get("id"), bool):
+        return None
+    name = doc["name"].get("fr") if isinstance(doc.get("name"), dict) else None
+    if not isinstance(name, str) or not name.strip():
+        return None
+    img = doc.get("img")
+    if not (isinstance(img, str) and img.startswith(DOFUSDB_IMG_PREFIX)):
+        icon = doc.get("iconId")   # l'image est toujours img/items/{iconId}.png
+        img = f"{DOFUSDB_IMG_PREFIX}{icon}.png" if isinstance(icon, int) and not isinstance(icon, bool) and icon >= 0 else None
+    if not img:
+        return None
+    type_name = None
+    if isinstance(doc.get("type"), dict) and isinstance(doc["type"].get("name"), dict):
+        type_name = doc["type"]["name"].get("fr") if isinstance(doc["type"]["name"].get("fr"), str) else None
+    level = doc.get("level")
+    type_id = doc.get("typeId")
+    return {"id": doc["id"], "name": name.strip(), "img": img, "type_name": type_name,
+            "type": type_id if isinstance(type_id, int) and not isinstance(type_id, bool) else None,
+            "level": level if isinstance(level, int) and not isinstance(level, bool) else None}
+
+def _find_item_by_name(http, key, raw, deadline):
+    """Cherche un equipement par son nom. Retourne (item, nombre de doublons) ou (None, 0)."""
+    for extra in ({"slug.fr": key}, {"name.fr": raw.strip()}):   # le slug ignore casse et accents ; sinon nom exact
+        params = {"typeId[$in][]": EQUIPMENT_TYPE_IDS, "$sort": "-id", **extra}
+        response = _http_get(http, f"{DOFUSDB_API}/items", params, deadline)
+        if response.status_code == 400:
+            continue   # filtre refuse par l'API : on essaie l'autre forme
+        response.raise_for_status()
+        try:
+            data = response.json().get("data")
+        except (ValueError, AttributeError):
+            continue
+        if not isinstance(data, list):
+            continue
+        matches = [it for it in (item_from_doc(d) for d in data) if it and item_key(it["name"]) == key]
+        if matches:
+            return max(matches, key=lambda it: it["id"]), len(matches)
+        # Aucune correspondance : soit l'objet n'existe pas, soit l'API a ignore le filtre. Dans les deux
+        # cas on n'en retient rien ; on tente l'autre forme avant de conclure.
+    return None, 0
+
+def lookup_dofusdb_item(reference, cache, budget=ITEM_LOOKUP_BUDGET):
+    """
+    Travail reseau, a lancer dans un thread. Retourne {"item", "icon" (octets PNG ou None), "notes"}.
+    Leve ItemLookupError (badref | notfound | network).
+    """
+    kind, value = parse_item_reference(reference)
+    if kind is None:
+        raise ItemLookupError("badref")
+    deadline = time.monotonic() + budget
+    http = requests.Session()
+    http.headers.update(DOFUSDB_HEADERS)
+    notes, item, duplicates = [], None, 1
+    cache = cache or {}
+    try:
+        if kind == "name":
+            key = item_key(value)
+            item = cache.get(key)
+            if item is None:
+                item, duplicates = _find_item_by_name(http, key, value, deadline)
+        else:
+            item = next((c for c in cache.values() if c.get("id") == value), None)
+            if item is None:
+                response = _http_get(http, f"{DOFUSDB_API}/items/{value}", None, deadline)
+                if response.status_code in (400, 404):
+                    raise ItemLookupError("notfound")
+                response.raise_for_status()
+                item = item_from_doc(response.json())
+        if item is None:
+            raise ItemLookupError("notfound")
+        if duplicates > 1:
+            notes.append(f"{duplicates} équipements portent ce nom : le plus récent (id {item['id']}) a été retenu. "
+                         "Donne l'identifiant pour en choisir un autre.")
+        icon = None
+        try:
+            icon = fetch_rune_icon(http, item["img"], deadline)
+        except Exception:
+            pass
+        if icon is None:
+            notes.append("icône indisponible pour l'instant (elle sera retéléchargée au prochain bilan)")
+        return {"item": item, "icon": icon, "notes": notes}
+    except ItemLookupError:
+        raise
+    except Exception as exc:
+        raise ItemLookupError("network", type(exc).__name__) from exc
+
+def load_item_icons(items, budget=RUNE_FETCH_BUDGET):
+    """Icones (octets PNG) des equipements d'un bilan : presque toujours depuis le cache disque."""
+    deadline = time.monotonic() + budget
+    http = requests.Session()
+    http.headers.update(DOFUSDB_HEADERS)
+    icons = {}
+    for item in items:
+        try:
+            raw = fetch_rune_icon(http, item.get("img"), deadline)
+        except Exception:
+            break   # reseau coupe ou budget epuise : inutile d'insister
+        if raw:
+            icons[item["id"]] = raw
+    return icons
+
+async def prepare_item_icons(report):
+    """Icones (data URI) des equipements de la periode du bilan. Ne leve JAMAIS : au pire, pas d'icones."""
+    items = {}
+    for _when, record in report["timeline"]:
+        item = record.get("item")
+        if item:
+            items[item["id"]] = item
+    if not RUNE_IMAGES_ENABLED or not items:
+        return {}
+    try:
+        raw = await asyncio.to_thread(load_item_icons, list(items.values()))
+    except Exception as exc:
+        print(f"[EQUIPEMENTS] icones indisponibles : {exc!r}")
+        return {}
+    return {item_id: "data:image/png;base64," + base64.b64encode(data).decode() for item_id, data in raw.items()}
+
+def channel_items():
+    return fm_state().setdefault("channel_items", {})
+
+def item_cache():
+    return fm_state().setdefault("item_cache", {})
+
+def can_tag_channel(user, channel_id):
+    """Proprietaire du salon FM, ou administrateur ; un salon sans proprietaire (classique) est libre."""
+    entry = fm_channels().get(str(channel_id))
+    if entry is None or str(user.id) == str(entry.get("owner_id")):
+        return True
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_channels))
+
+def item_autocomplete_choices(current, limit=25):
+    """Objets deja resolus qui contiennent le texte saisi (aucun appel reseau) : [(libelle, valeur)]."""
+    needle = item_key(current)
+    found = [item for key, item in item_cache().items() if needle in key]
+    found.sort(key=lambda item: item["name"])
+    return [((f"{item['name']} (niv. {item['level']})" if item.get("level") else item["name"]), item["name"])
+            for item in found[:limit]]
+
 # ---------------- BILAN : PAGE HTML ---------------- #
 # Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
 # n'importe quel navigateur, suit le theme clair/sombre et s'imprime proprement (PDF pour un client).
@@ -1422,6 +1608,9 @@ th[aria-sort=descending]::after{content:" ▼";font-size:.7em}
 .ph{display:inline-flex;align-items:center;justify-content:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:.85rem}
 .rname{display:flex;align-items:center;gap:10px;text-align:left}
 .warn{color:var(--warn)}
+.chip.item{display:inline-flex;align-items:center;gap:6px;font-weight:600;border-color:var(--accent)}
+.ico.sm{width:22px;height:22px}
+.lv{color:var(--muted);font-weight:400}
 @media print{.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
 """
 
@@ -1470,7 +1659,7 @@ def _kamas_short(n):
         return sign + f"{value:f}".rstrip("0").rstrip(".").replace(".", ",") + unit
     return f"{sign}{n}"
 
-def render_report_html(report, owner_name_of, runes=None):
+def render_report_html(report, owner_name_of, runes=None, item_icons=None):
     esc = html_lib.escape
     tz, start, end = report["tz"], report["start"], report["end"]
     period = report["period"]
@@ -1560,6 +1749,12 @@ def render_report_html(report, owner_name_of, runes=None):
                         f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)) + "</span>")
                 if owner:
                     chips.append(f'<span class="chip who">{esc(owner)}</span>')
+                linked = r.get("item")
+                if linked:
+                    uri = (item_icons or {}).get(linked["id"])
+                    pic = f'<img class="ico sm" alt="" src="{uri}" width="22" height="22">' if uri else ""
+                    lvl = f" · niv. {linked['level']}" if linked.get("level") else ""
+                    chips.insert(0, f'<span class="chip item">{pic}{esc(linked["name"] + lvl)}</span>')
                 top = list((r.get("items") or {}).items())[:3]
                 items_line = ""
                 if top:
@@ -1629,6 +1824,20 @@ def render_report_html(report, owner_name_of, runes=None):
                 for name, (qty, price) in report["top_items"]]
         parts.append(sortable_table([("Objet", "text", ""), ("Quantité", "num", ""), ("Dépensé", "num", "")], rows))
 
+    # ---- equipements associes aux salons (/fmitem) ----
+    if report.get("by_item"):
+        parts.append("<h2>Équipements forgés (période affichée)</h2>")
+        rows = []
+        for slot in sorted(report["by_item"].values(), key=lambda sl: -(sl["agg"]["total"] + sl["agg"]["adjust"])):
+            it, agg = slot["item"], slot["agg"]
+            uri = (item_icons or {}).get(it["id"])
+            pic = (f'<img class="ico" alt="" src="{uri}" width="36" height="36">' if uri
+                   else '<span class="ico ph" title="Image indisponible">?</span>')
+            lvl = f' <span class="lv">niv. {it["level"]}</span>' if it.get("level") else ""
+            rows.append(([(f'<span class="rname">{pic}<span>{esc(it["name"])}{lvl}</span></span>', it["name"])]
+                         + agg_cells(agg), False))
+        parts.append(sortable_table([("Équipement", "text", "")] + agg_heads, rows))
+
     # ---- galerie des runes (a la fin) ----
     gallery_notes = []
     if runes and runes.get("rows"):
@@ -1646,11 +1855,6 @@ def render_report_html(report, owner_name_of, runes=None):
                           (amount(average), average)], False))
         parts.append(sortable_table([("Rune", "text", ""), ("Quantité", "num", ""), ("Dépensé", "num", ""),
                                      ("Prix moyen / unité", "num", "Dépensé ÷ quantité")], rows))
-        if report["sample"]:
-            gallery_notes.append("Images d'exemple (pictogrammes fictifs) : dans un vrai bilan, ce sont les illustrations "
-                                 "des runes fournies par DofusDB.")
-        else:
-            gallery_notes.append("Images des runes : DofusDB (illustrations © Ankama), chargées à la demande puis conservées en cache.")
         if any(r["status"] == "unknown" for r in runes["rows"]):
             gallery_notes.append("Une rune marquée « nom inconnu de DofusDB » ne correspond à aucune rune connue : "
                                  "c'est souvent une faute de lecture de la capture, à vérifier.")
@@ -1663,6 +1867,18 @@ def render_report_html(report, owner_name_of, runes=None):
              "Dépensé = achats lus sur les captures. Facturé = dépensé + stock apporté. Payé = paiements enregistrés "
              "pendant la session : un règlement fait après la fermeture n'est pas connu du bot.",
              f"Mois, trimestres et années sont lus en heure de {esc(str(tz))}."]
+    if (item_icons or any(r["icon"] for r in (runes or {}).get("rows", []))):
+        if report["sample"]:
+            gallery_notes.insert(0, "Images d'exemple (pictogrammes fictifs) : dans un vrai bilan, ce sont les illustrations "
+                                    "fournies par DofusDB.")
+        else:
+            gallery_notes.insert(0, "Images : DofusDB (illustrations © Ankama), chargées à la demande puis conservées en cache.")
+    if report.get("unlinked") and (report.get("by_item") or report.get("items_in_use")):
+        shown = report["unlinked"][:8]
+        more = f" (+{len(report['unlinked']) - 8})" if len(report["unlinked"]) > 8 else ""
+        gallery_notes.append(esc(f"{len(report['unlinked'])} salon(s) sans équipement associé : "
+                                 + ", ".join("#" + n for n in shown) + more
+                                 + ". Associe-les avec /fmitem (même un salon archivé)."))
     notes.extend(gallery_notes)
     if report["undated"]:
         notes.append(f"{report['undated']} session(s) sans date lisible n'apparaissent pas dans la chronologie ni dans les totaux.")
@@ -2301,6 +2517,7 @@ def channel_welcome_embed():
             "`/fmstats` · statistiques de tes tentatives (taux de réussite, rythme)\n"
             "`/fmhistorique` · ton historique et tes records (ou ceux d'un autre joueur)\n"
             "`/fmbilan` · page de bilan : chronologie et totaux par mois, trimestre, année\n"
+            "`/fmitem` · associer l'équipement forgé à ce salon (son icône apparaît dans le bilan)\n"
             "`/fmstop` · fermer la session et voir le résumé\n"
             "`/fmstart` · nouvelle session\n"
             "`/fmreset` · remettre à zéro\n"
@@ -2566,6 +2783,71 @@ async def fmhistorique(interaction: discord.Interaction, joueur: discord.Member 
         embed=history_embed(target.display_name, profile, records, len(owned), without_details),
         ephemeral=True)
 
+@bot.tree.command(name="fmitem", description="Associer un équipement (DofusDB) à un salon : son icône apparaît dans le bilan")
+@app_commands.describe(
+    objet="Nom exact (Anneau de Padgref), identifiant ou adresse de la fiche DofusDB ; « aucun » pour retirer",
+    salon="Salon à associer (par défaut : celui-ci). Utile pour un salon archivé, où l'on ne peut plus écrire",
+)
+async def fmitem(interaction: discord.Interaction, objet: str, salon: discord.TextChannel = None):
+    target = salon or interaction.channel
+    target_id = str(target.id)
+    if not can_tag_channel(interaction.user, target_id):
+        return await interaction.response.send_message(
+            "Seul le propriétaire du salon (ou un administrateur) peut lui associer un équipement.", ephemeral=True)
+    elsewhere = target_id != str(interaction.channel.id)
+
+    if item_key(objet) in ITEM_REMOVE_WORDS:
+        removed = channel_items().pop(target_id, None)
+        if removed:
+            save_data()
+        text = (f"Équipement retiré du salon : {removed['name']}." if removed else "Aucun équipement n'était associé à ce salon.")
+        return await interaction.response.send_message(text, ephemeral=elsewhere)
+
+    await interaction.response.defer(ephemeral=elsewhere)
+    try:
+        found = await asyncio.to_thread(lookup_dofusdb_item, objet, dict(item_cache()))
+    except ItemLookupError as exc:
+        messages = {
+            "badref": "Référence illisible. Donne le nom exact de l'équipement, son identifiant DofusDB, ou l'adresse de sa fiche.",
+            "notfound": (f"Équipement introuvable : « {objet} ». Vérifie l'orthographe exacte (accents compris), ou donne "
+                         "son identifiant DofusDB (`/fmitem objet:34329`) ou l'adresse de sa fiche."),
+            "network": f"DofusDB est injoignable pour le moment ({exc.detail or 'erreur réseau'}). Réessaie dans quelques minutes.",
+        }
+        return await interaction.followup.send(messages.get(exc.kind, "Recherche impossible."), ephemeral=True)
+    except Exception as exc:
+        print(f"[EQUIPEMENTS] /fmitem a echoue : {exc!r}")
+        return await interaction.followup.send("Erreur inattendue pendant la recherche : le détail est dans les logs du bot.", ephemeral=True)
+
+    item = found["item"]
+    item_cache()[item_key(item["name"])] = item
+    channel_items()[target_id] = item
+    save_data()
+
+    def build_embed():
+        detail = " · ".join(x for x in (f"Niveau {item['level']}" if item.get("level") else None, item.get("type_name"),
+                                       f"id {item['id']}") if x)
+        embed = discord.Embed(title=f"Équipement associé : {item['name']}", description=detail, color=discord.Color.blurple())
+        embed.add_field(name="Salon", value=f"<#{target_id}>", inline=True)
+        if found["notes"]:
+            embed.add_field(name="À savoir", value="\n".join(found["notes"])[:1000], inline=False)
+        if found["icon"]:
+            embed.set_thumbnail(url="attachment://objet.png")
+        return embed
+
+    def build_files():
+        return {"file": discord.File(BytesIO(found["icon"]), filename="objet.png")} if found["icon"] else {}
+
+    await interaction.followup.send(embed=build_embed(), **build_files())
+    if elsewhere:   # le salon cible (peut-etre archive) garde une trace visible de l'association
+        try:
+            await target.send(embed=build_embed(), **build_files())
+        except discord.HTTPException as exc:
+            print(f"[EQUIPEMENTS] message non poste dans #{getattr(target, 'name', '?')} : {exc}")
+
+@fmitem.autocomplete("objet")
+async def fmitem_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=label[:100], value=value[:100]) for label, value in item_autocomplete_choices(current)]
+
 @bot.tree.command(name="fmbilan", description="Page de bilan : chronologie des sessions et totaux par mois, trimestre, année")
 @app_commands.describe(
     periode="Période détaillée dans la chronologie (mois par défaut)",
@@ -2606,7 +2888,9 @@ async def fmbilan(interaction: discord.Interaction, periode: str = "mois", reper
 
     player_id = str(joueur.id) if joueur else None
     closed = [r for r in fm_state().get("history", []) if player_id is None or r.get("owner") == player_id]
-    records = closed + live_records(name_of, player_id)
+    linked_items = channel_items()
+    # Copies : l'equipement associe est ajoute a la volee, il ne doit jamais s'ecrire dans l'historique.
+    records = [dict(r, item=linked_items.get(str(r.get("ch")))) for r in closed + live_records(name_of, player_id)]
     if not records:
         return await interaction.followup.send(
             "Aucune session enregistrée pour le moment. L'historique démarre avec la fermeture des sessions "
@@ -2621,7 +2905,9 @@ async def fmbilan(interaction: discord.Interaction, periode: str = "mois", reper
             runes = {"rows": build_rune_rows(report["items_all"], gallery), "notes": gallery["notes"]}
         except Exception as exc:   # le bilan prime : sans images plutot que pas de bilan
             print(f"[RUNES] galerie ignoree : {exc!r}")
-    page = render_report_html(report, owner_name_of, runes)
+    report["items_in_use"] = bool(linked_items)
+    item_icons = await prepare_item_icons(report)
+    page = render_report_html(report, owner_name_of, runes, item_icons)
     p = report["period"]
     summary = (f"**{label}** : {p['n']} session(s) · dépensé {format_number(p['total'])} · "
                f"facturé {format_number(p['total'] + p['adjust'])} · payé {format_number(p['paid'])} kamas")

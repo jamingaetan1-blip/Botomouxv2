@@ -3362,7 +3362,7 @@ class ChannelNameModal(discord.ui.Modal, title="Nouvelle séance de FM"):
 # Emoji du bouton : l'icone de la Rune Ga Pa, enregistree comme emoji de l'application
 # (servie par le site Dofus Craft ; FM_BUTTON_EMOJI_URL permet d'en changer).
 BUTTON_EMOJI_NAME = "rune_ga_pa"
-BUTTON_EMOJI_URL = os.environ.get("FM_BUTTON_EMOJI_URL", "https://dofus-craft.dofus-craft.workers.dev/rune-ga-pa.png")
+BUTTON_EMOJI_URL = os.environ.get("FM_BUTTON_EMOJI_URL", "https://dofus-craft.handy-apps.workers.dev/rune-ga-pa.png")
 button_emoji = "🔨"
 
 async def ensure_button_emoji():
@@ -3401,8 +3401,8 @@ WELCOME_VERSION = 5
 # Apparence du message d'accueil : bleu du Zaap et une illustration du Zaap (servie
 # par le site Dofus Craft ; FM_WELCOME_IMAGE_URL permet d'en changer sans toucher au code).
 WELCOME_COLOR = discord.Color.from_rgb(54, 169, 225)
-WELCOME_IMAGE = os.environ.get("FM_WELCOME_IMAGE_URL", "https://dofus-craft.dofus-craft.workers.dev/fm-banner.jpg")
-SITE_PAGE = "https://dofus-craft.dofus-craft.workers.dev/forgemagie"
+WELCOME_IMAGE = os.environ.get("FM_WELCOME_IMAGE_URL", "https://dofus-craft.handy-apps.workers.dev/fm-banner.jpg")
+SITE_PAGE = "https://dofus-craft.handy-apps.workers.dev/forgemagie"
 
 # Message poste dans un salon FM qui vient d'etre cree : c'est la que les commandes servent.
 def channel_welcome_embed():

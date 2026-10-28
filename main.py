@@ -1647,6 +1647,9 @@ h3{font-size:.95rem;margin:0}
 .badge{display:inline-block;font-size:.72rem;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
 .badge.live{color:var(--ok);border-color:var(--ok)}
 .badge.del{color:var(--warn);border-color:var(--warn)}
+.statehead{display:flex;align-items:center;gap:10px;margin:22px 0 4px;font-size:1rem}
+.statehead .badge{font-size:.85rem;padding:3px 12px}
+.statehead .statecount{color:var(--muted);font-size:.8rem;font-weight:400}
 .scroll{overflow-x:auto;border-radius:12px}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);font-size:.9rem}
 th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -1818,56 +1821,71 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
     if not report["timeline"]:
         parts.append('<div class="empty">Aucune session sur cette période.</div>')
     else:
-        days = {}
+        # D'abord par etat (en cours, terminees, salons supprimes), puis par date a l'interieur de chaque etat.
+        def state_of(r):
+            if r.get("live"):
+                return 0
+            return 2 if r.get("why") == "deleted" else 1
+        state_labels = (("live", "En cours"), ("", "Terminées"), ("del", "Salons supprimés"))
+        grouped = [[], [], []]
         for when, record in report["timeline"]:
-            days.setdefault(when.date(), []).append((when, record))
-        for day, rows in days.items():
-            title = f"{DAYS_FR[day.weekday()].capitalize()} {day.day} {MONTHS_FR[day.month - 1]} {day.year}"
-            day_total = sum(record_amount(r) for _w, r in rows)
-            parts.append(f'<section class="day"><h3><span class="d">{esc(title)}</span>'
-                         f'<span class="daytotal">{amount(day_total)} kamas</span></h3><ol class="tl">')
-            for when, r in rows:
-                if r.get("live"):
-                    badge = '<span class="badge live">en cours</span>'
-                elif r.get("why") == "deleted":
-                    badge = '<span class="badge del">salon supprimé</span>'
-                else:
-                    badge = '<span class="badge">terminée</span>'
-                owner = owner_name_of(r.get("owner")) if r.get("owner") else None
-                counts = r.get("attempts") or {}
-                tries = sum(counts.values())
-                # Carte epuree : le total a droite suffit. Ni depense, ni acompte, ni ajustement, ni stock (suivi du stock : carte de synthese).
-                chips = []
-                if tries:
-                    chips.append('<span class="chip">' + esc("  ".join(
-                        f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)) + "</span>")
-                if owner:
-                    chips.append(f'<span class="chip who">{esc(owner)}</span>')
-                linked = r.get("item")
-                tile, uri, label = "", None, ""
-                if linked:
-                    uri = (item_icons or {}).get(linked["id"])
-                    lvl = f" · niv. {linked['level']}" if linked.get("level") else ""
-                    label = linked["name"] + lvl
-                    chips.insert(0, f'<span class="chip item">{esc(label)}</span>')
-                inner = f'<img src="{uri}" alt="" width="64" height="64">' if uri else ""
-                if str(r.get("ch")) in shots:   # capture de l'equipement termine : vignette cliquable (appareil photo si pas d'icone)
-                    tile = shot_link(r.get("ch"), inner or '<span class="camph" aria-hidden="true">📷</span>', r, when,
-                                     cls="tile", title=label)
-                elif inner:   # grande vignette carree entre le contenu et le montant
-                    tile = f'<div class="tile" title="{esc(label)}">{inner}</div>'
-                top = list((r.get("items") or {}).items())[:3]
-                items_line = ""
-                if top:
-                    items_line = ('<div class="meta">' + esc(" · ".join(
-                        f"{name} ({_kamas_short(price)})" for name, (_q, price) in top)) + "</div>")
-                parts.append(
-                    ('<li class="has-tile">' if tile else "<li>") + '<div class="main"><div class="row1">'
-                    f'<span class="when">{when.strftime("%H:%M")}</span>'
-                    f'<span class="name">#{esc(r.get("name") or "salon")}</span>{badge}</div>'
-                    f'<div class="chips">{"".join(chips)}</div>{items_line}</div>'
-                    + tile + f'<div class="amt">{amount(record_amount(r))} kamas</div></li>')
-            parts.append("</ol></section>")
+            grouped[state_of(record)].append((when, record))
+        for state_index, group in enumerate(grouped):
+            if not group:
+                continue
+            cls, state_title = state_labels[state_index]
+            parts.append(f'<h3 class="statehead"><span class="badge {cls}">{esc(state_title)}</span>'
+                         f'<span class="statecount">{len(group)} session(s)</span></h3>')
+            days = {}
+            for when, record in group:
+                days.setdefault(when.date(), []).append((when, record))
+            for day, rows in days.items():
+                title = f"{DAYS_FR[day.weekday()].capitalize()} {day.day} {MONTHS_FR[day.month - 1]} {day.year}"
+                day_total = sum(record_amount(r) for _w, r in rows)
+                parts.append(f'<section class="day"><h3><span class="d">{esc(title)}</span>'
+                             f'<span class="daytotal">{amount(day_total)} kamas</span></h3><ol class="tl">')
+                for when, r in rows:
+                    if r.get("live"):
+                        badge = '<span class="badge live">en cours</span>'
+                    elif r.get("why") == "deleted":
+                        badge = '<span class="badge del">salon supprimé</span>'
+                    else:
+                        badge = '<span class="badge">terminée</span>'
+                    owner = owner_name_of(r.get("owner")) if r.get("owner") else None
+                    counts = r.get("attempts") or {}
+                    tries = sum(counts.values())
+                    # Carte epuree : le total a droite suffit. Ni depense, ni acompte, ni ajustement, ni stock (suivi du stock : carte de synthese).
+                    chips = []
+                    if tries:
+                        chips.append('<span class="chip">' + esc("  ".join(
+                            f"{emoji} {counts.get(key, 0)}" for key, _l, emoji, _st in FM_OUTCOMES)) + "</span>")
+                    if owner:
+                        chips.append(f'<span class="chip who">{esc(owner)}</span>')
+                    linked = r.get("item")
+                    tile, uri, label = "", None, ""
+                    if linked:
+                        uri = (item_icons or {}).get(linked["id"])
+                        lvl = f" · niv. {linked['level']}" if linked.get("level") else ""
+                        label = linked["name"] + lvl
+                        chips.insert(0, f'<span class="chip item">{esc(label)}</span>')
+                    inner = f'<img src="{uri}" alt="" width="64" height="64">' if uri else ""
+                    if str(r.get("ch")) in shots:   # capture de l'equipement termine : vignette cliquable (appareil photo si pas d'icone)
+                        tile = shot_link(r.get("ch"), inner or '<span class="camph" aria-hidden="true">📷</span>', r, when,
+                                         cls="tile", title=label)
+                    elif inner:   # grande vignette carree entre le contenu et le montant
+                        tile = f'<div class="tile" title="{esc(label)}">{inner}</div>'
+                    top = list((r.get("items") or {}).items())[:3]
+                    items_line = ""
+                    if top:
+                        items_line = ('<div class="meta">' + esc(" · ".join(
+                            f"{name} ({_kamas_short(price)})" for name, (_q, price) in top)) + "</div>")
+                    parts.append(
+                        ('<li class="has-tile">' if tile else "<li>") + '<div class="main"><div class="row1">'
+                        f'<span class="when">{when.strftime("%H:%M")}</span>'
+                        f'<span class="name">#{esc(r.get("name") or "salon")}</span>{badge}</div>'
+                        f'<div class="chips">{"".join(chips)}</div>{items_line}</div>'
+                        + tile + f'<div class="amt">{amount(record_amount(r))} kamas</div></li>')
+                parts.append("</ol></section>")
 
     # ---- graphique : depense par mois ----
     chart = report["chart"]
@@ -3295,6 +3313,24 @@ def explain_discord_error(exc):
         return "Discord limite temporairement cette action : réessaie dans quelques minutes."
     return f"Discord a refusé ({status or '?'}{', code ' + str(code) if code else ''}) : {text or 'sans précision'}"
 
+async def pick_archive_category(guild, main):
+    """Une categorie Discord est limitee a 50 salons : quand « Archives FM » est pleine, le bot en cree une
+    suivante (« Archives FM 2 », « Archives FM 3 »...) avec les memes droits, et y range les archives."""
+    if main is None:
+        return None
+    family = [c for c in guild.categories
+              if c.id == main.id or c.name.startswith(FM_ARCHIVE_CATEGORY_NAME + " ")]
+    family.sort(key=lambda c: (c.id != main.id, c.position))
+    for category in family:
+        if len(category.channels) < 50:
+            return category
+    try:
+        return await guild.create_category(
+            f"{FM_ARCHIVE_CATEGORY_NAME} {len(family) + 1}", overwrites=dict(main.overwrites))
+    except discord.HTTPException as exc:
+        print(f"[ARCHIVAGE] impossible de creer une categorie d'archives supplementaire : {exc}")
+        return main
+
 async def archive_fm_channel(channel, message):
     entry = fm_channels().get(str(channel.id))
     if not entry or entry.get("status") != "active":
@@ -3311,6 +3347,7 @@ async def archive_fm_channel(channel, message):
     archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
     if archive is None and await ensure_fm_places(guild):
         archive = fm_place(guild, "archive_category_id", discord.CategoryChannel)
+    archive = await pick_archive_category(guild, archive)
 
     # 1. Le deplacement D'ABORD : c'est l'etape que Discord peut refuser (categorie pleine, droit
     #    manquant, limite de debit). Si elle echoue, rien n'a ete ferme : la session, ses totaux et son

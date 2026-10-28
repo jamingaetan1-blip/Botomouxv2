@@ -1607,6 +1607,8 @@ def item_autocomplete_choices(current, limit=25):
 # ---------------- BILAN : PAGE HTML ---------------- #
 # Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
 # n'importe quel navigateur, suit le theme clair/sombre et s'imprime proprement (PDF pour un client).
+MAX_SHOT_THUMBS = 6   # vignettes de captures par equipement dans le tableau recapitulatif
+
 REPORT_CSS = """
 :root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--live:#a16207;--bad:#c0262d;--bar:#a5b4fc;--tile:80px;--tile-img:64px}
 @media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--live:#f2c94c;--bad:#ff7b7b;--bar:#4a52a8}}
@@ -1683,6 +1685,11 @@ th[aria-sort=descending]::after{content:" ▼";font-size:.7em}
 .shot:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:12px}
 .tile{position:relative}
 a.tile.shot{display:flex}
+.pics{display:inline-flex;flex:none;gap:10px;align-items:flex-start}
+.pthumb{display:inline-flex!important;flex:none;flex-direction:column;align-items:center;gap:1px;min-width:44px}
+.pwho{font-size:.65rem;color:var(--muted);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pthumb .cam{bottom:auto;top:-5px}
+.pmore{align-self:center;color:var(--muted);font-size:.8rem}
 .camph{font-size:1.8rem;opacity:.75}
 .cam{position:absolute;right:-5px;bottom:-5px;font-size:.68rem;line-height:1;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:2px 4px;box-shadow:0 1px 3px rgba(0,0,0,.25)}
 .lb{display:none;position:fixed;inset:0;z-index:60;align-items:center;justify-content:center;background:rgba(10,12,20,.72);padding:16px}
@@ -1955,10 +1962,19 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
             pic = (f'<img class="ico" alt="" src="{uri}" width="36" height="36">' if uri
                    else '<span class="ico ph" title="Image indisponible">?</span>')
             lvl = f' <span class="lv">niv. {it["level"]}</span>' if it.get("level") else ""
-            with_shot = [(w, rr) for w, rr in slot["records"] if str(rr.get("ch")) in shots]
-            if with_shot:   # la capture la plus recente de cet equipement
-                w_best, r_best = max(with_shot, key=lambda x: x[0])
-                pic = shot_link(r_best.get("ch"), pic, r_best, w_best)
+            # Une vignette par session AYANT une capture (deux forgemages sur le meme equipement : deux images),
+            # chacune avec le prenom de son forgemage et son propre apercu au survol.
+            with_shot = sorted(((w, rr) for w, rr in slot["records"] if str(rr.get("ch")) in shots), key=lambda x: x[0])
+            if with_shot:
+                thumbs = []
+                for w_s, r_s in with_shot[:MAX_SHOT_THUMBS]:
+                    who = owner_name_of(r_s.get("owner")) if r_s.get("owner") else ""
+                    inner = pic + (f'<span class="pwho">{esc(who)}</span>' if who else "")
+                    thumbs.append(shot_link(r_s.get("ch"), inner, r_s, w_s, cls="pthumb"))
+                more = len(with_shot) - MAX_SHOT_THUMBS
+                if more > 0:
+                    thumbs.append(f'<span class="pmore">+{more}</span>')
+                pic = '<span class="pics">' + "".join(thumbs) + "</span>"
             rows.append(([(f'<span class="rname">{pic}<span>{esc(it["name"])}{lvl}</span></span>', it["name"])]
                          + agg_cells(agg), False))
         parts.append(sortable_table([("Équipement", "text", "")] + agg_heads, rows))

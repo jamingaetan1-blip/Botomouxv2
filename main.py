@@ -1608,8 +1608,8 @@ def item_autocomplete_choices(current, limit=25):
 # Page autonome (aucun script, aucune ressource externe, aucune image) : elle s'ouvre hors ligne dans
 # n'importe quel navigateur, suit le theme clair/sombre et s'imprime proprement (PDF pour un client).
 REPORT_CSS = """
-:root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--bar:#a5b4fc;--tile:80px;--tile-img:64px}
-@media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--bar:#4a52a8}}
+:root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--live:#a16207;--bad:#c0262d;--bar:#a5b4fc;--tile:80px;--tile-img:64px}
+@media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--live:#f2c94c;--bad:#ff7b7b;--bar:#4a52a8}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:980px;margin:0 auto;padding:28px 18px 60px}
@@ -1645,8 +1645,9 @@ h3{font-size:.95rem;margin:0}
 .chip{font-size:.8rem;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:1px 9px;max-width:100%;overflow-wrap:anywhere}
 .chip.who{color:var(--accent);border-color:var(--accent)}
 .badge{display:inline-block;font-size:.72rem;padding:1px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
-.badge.live{color:var(--ok);border-color:var(--ok)}
-.badge.del{color:var(--warn);border-color:var(--warn)}
+.badge.live{color:var(--live);border-color:var(--live)}
+.badge.done{color:var(--ok);border-color:var(--ok)}
+.badge.del{color:var(--bad);border-color:var(--bad)}
 .statehead{display:flex;align-items:center;gap:10px;margin:22px 0 4px;font-size:1rem}
 .statehead .badge{font-size:.85rem;padding:3px 12px}
 .statehead .statecount{color:var(--muted);font-size:.8rem;font-weight:400}
@@ -1826,7 +1827,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
             if r.get("live"):
                 return 0
             return 2 if r.get("why") == "deleted" else 1
-        state_labels = (("live", "En cours"), ("", "Terminées"), ("del", "Salons supprimés"))
+        state_labels = (("live", "En cours"), ("done", "Terminées"), ("del", "Salons supprimés"))
         grouped = [[], [], []]
         for when, record in report["timeline"]:
             grouped[state_of(record)].append((when, record))
@@ -1850,7 +1851,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
                     elif r.get("why") == "deleted":
                         badge = '<span class="badge del">salon supprimé</span>'
                     else:
-                        badge = '<span class="badge">terminée</span>'
+                        badge = '<span class="badge done">terminée</span>'
                     owner = owner_name_of(r.get("owner")) if r.get("owner") else None
                     counts = r.get("attempts") or {}
                     tries = sum(counts.values())

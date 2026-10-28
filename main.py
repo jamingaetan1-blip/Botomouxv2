@@ -1611,7 +1611,12 @@ MAX_SHOT_THUMBS = 6   # vignettes de captures par equipement dans le tableau rec
 
 REPORT_CSS = """
 :root{--bg:#f6f7fb;--card:#fff;--text:#1d2333;--muted:#667085;--line:#e4e7ee;--accent:#4f46e5;--accent-soft:#e8e7fd;--ok:#12805c;--warn:#b54708;--live:#a16207;--bad:#c0262d;--bar:#a5b4fc;--tile:80px;--tile-img:64px}
-@media (prefers-color-scheme:dark){:root{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--live:#f2c94c;--bad:#ff7b7b;--bar:#4a52a8}}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--live:#f2c94c;--bad:#ff7b7b;--bar:#4a52a8}}
+:root[data-theme="dark"]{--bg:#10131c;--card:#181c28;--text:#e6e9f2;--muted:#9aa3b8;--line:#272d3d;--accent:#8b93ff;--accent-soft:#232852;--ok:#4cc9a0;--warn:#f5a45d;--live:#f2c94c;--bad:#ff7b7b;--bar:#4a52a8}
+:root[data-theme="light"]{color-scheme:light}
+:root[data-theme="dark"]{color-scheme:dark}
+.themebtn{position:fixed;top:12px;right:12px;z-index:5;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:6px 12px;font:inherit;font-size:.85rem;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.themebtn:hover{border-color:var(--accent)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:980px;margin:0 auto;padding:28px 18px 60px}
@@ -1699,10 +1704,17 @@ a.tile.shot{display:flex}
 .lb img{display:block;max-width:100%;max-height:78vh;margin:0 auto;border-radius:8px}
 .lb figcaption{display:flex;justify-content:space-between;align-items:center;gap:12px;color:var(--muted);font-size:.85rem;padding:8px 4px 0}
 .lb figcaption a{color:var(--accent);text-decoration:none;font-weight:600;white-space:nowrap}
-@media print{.lb,.cam{display:none!important}.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
+@media print{.themebtn{display:none!important}.lb,.cam{display:none!important}.hint{display:none}body{background:#fff;color:#000}.kpi,.tl li,table,.chart{border-color:#bbb}.tl li,tr,.kpi{break-inside:avoid}}
 """
 
 REPORT_JS = """(function(){
+var root=document.documentElement,btn=document.getElementById('theme');
+function store(v){try{if(v)localStorage.setItem('bilan-theme',v);else return localStorage.getItem('bilan-theme')}catch(e){}return null}
+function isDark(){var t=root.getAttribute('data-theme');return t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches}
+function label(){if(btn)btn.textContent=isDark()?'☀️ Mode clair':'🌙 Mode sombre'}
+var saved=store();if(saved==='dark'||saved==='light')root.setAttribute('data-theme',saved);
+if(btn)btn.addEventListener('click',function(){var next=isDark()?'light':'dark';root.setAttribute('data-theme',next);store(next);label()});
+label();
 function num(v){var n=parseFloat(v);return isNaN(n)?0:n}
 var tables=document.querySelectorAll('table.sortable');
 Array.prototype.forEach.call(tables,function(table){
@@ -2051,7 +2063,7 @@ def render_report_html(report, owner_name_of, runes=None, item_icons=None, shots
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; "
             f"img-src data:; script-src '{REPORT_JS_HASH}'\">"
-            f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}{shot_css}</style></head><body><main>"
+            f"<title>Bilan FM · {esc(report['label'])}</title><style>{REPORT_CSS}{shot_css}</style></head><body><button type=\"button\" id=\"theme\" class=\"themebtn\"></button><main>"
             + "".join(parts) + f"</main>{''.join(pool)}<script>{REPORT_JS}</script></body></html>")
 
 # ---------------- CORRECTIONS DE SESSION : /fmreset confirme, /fmundo, /fmadd ---------------- #

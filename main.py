@@ -3175,15 +3175,35 @@ async def ensure_fm_places(guild):
     return True
 
 # Met en place les salons FM d'un serveur : au demarrage, et quand le bot rejoint un serveur.
+async def repair_bot_rights(guild):
+    """Ajoute le droit « Gerer les permissions » au bot dans les salons FM existants qui ne l'ont pas."""
+    wanted = bot_channel_overwrite(guild)
+    if not wanted.manage_roles:
+        print(f"[Droits] \"{guild.name}\" : donne « Gérer les rôles » au rôle du bot pour que les salons se mettent à jour seuls")
+        return
+    fixed = 0
+    for channel_id in list(fm_channels()):
+        channel = guild.get_channel(int(channel_id))
+        if channel is None or channel.overwrites_for(guild.me).manage_roles:
+            continue
+        try:
+            await channel.set_permissions(guild.me, overwrite=wanted)
+            fixed += 1
+        except discord.HTTPException as exc:
+            print(f"[Droits] #{channel.name} : mise à jour impossible : {exc}")
+    if fixed:
+        print(f"[Droits] \"{guild.name}\" : droit ajouté dans {fixed} salon(s) FM")
+
 async def setup_guild(guild):
     if not await ensure_fm_places(guild):
         return
+    await repair_bot_rights(guild)
     try:
         await ensure_welcome_message(guild)
     except discord.HTTPException as error:
         print(f"[Salons FM] Message d'accueil impossible sur \"{guild.name}\" : {error}")
 
-def bot_channel_overwrite():
+def bot_channel_overwrite(guild=None):
     """Droits du bot dans un salon FM. Les droits d'epinglage (« Gerer les messages » et, sur les
     versions recentes de Discord et de discord.py, « Epingler des messages ») ne sont demandes
     que si le panneau est epingle (FM_PANEL_FOLLOWS=0)."""
@@ -3191,6 +3211,11 @@ def bot_channel_overwrite():
         view_channel=True, send_messages=True, embed_links=True,
         read_message_history=True, manage_channels=True,
     )
+    # « Gerer les permissions » : necessaire pour archiver (le bot change les droits du proprietaire).
+    # Discord interdit d'accorder un droit qu'on n'a pas soi-meme : on ne le demande donc que si le bot l'a.
+    me_perms = guild.me.guild_permissions if guild is not None else None
+    if me_perms is not None and (me_perms.administrator or me_perms.manage_roles):
+        perms["manage_roles"] = True
     if not FM_PANEL_FOLLOWS:
         perms["manage_messages"] = True
         if hasattr(discord.Permissions, "pin_messages"):
@@ -3226,7 +3251,7 @@ async def create_fm_channel(guild, member, raw_name, command_id=None):
             view_channel=True, send_messages=True, attach_files=True,
             read_message_history=True, use_application_commands=True,
         ),
-        guild.me: bot_channel_overwrite(),
+        guild.me: bot_channel_overwrite(guild),
     }
     channel = await guild.create_text_channel(
         channel_name, category=category, overwrites=overwrites,
@@ -3264,8 +3289,8 @@ def explain_discord_error(exc):
         return ("la catégorie de destination est pleine (Discord limite une catégorie à 50 salons). "
                 "Libère de la place dans la catégorie d'archives, ou change-la.")
     if code == 50013 or status == 403:
-        return ("il me manque un droit (Gérer les salons, et Gérer les rôles pour modifier les permissions "
-                "d'un salon). Vérifie les droits du rôle du bot.")
+        return ("il me manque un droit (Gérer les salons ET Gérer les rôles, sur le serveur et sur la catégorie "
+                "d'archives). Un administrateur peut taper `!droits` pour voir ce qui manque.")
     if status == 429:
         return "Discord limite temporairement cette action : réessaie dans quelques minutes."
     return f"Discord a refusé ({status or '?'}{', code ' + str(code) if code else ''}) : {text or 'sans précision'}"
@@ -4220,6 +4245,46 @@ async def sync(ctx):
     if error is not None:
         return await ctx.send(f"❌ Synchronisation refusée par Discord : {str(error)[:1500]}")
     await ctx.send(f"✅ {len(names)} commandes synchronisées (version {BOT_VERSION}) : " + ", ".join(f"/{n}" for n in names))
+
+def permission_report(guild):
+    """Verifie les droits dont le bot a besoin pour creer, archiver et rouvrir les salons FM."""
+    me = guild.me
+    base = me.guild_permissions
+    lines = []
+    if base.administrator:
+        lines.append("✅ Le rôle du bot est **Administrateur** : tous les droits sont couverts.")
+    needed = [
+        ("view_channel", "Voir les salons"), ("manage_channels", "Gérer les salons"),
+        ("manage_roles", "Gérer les rôles (modifier les permissions d'un salon : indispensable pour archiver)"),
+        ("send_messages", "Envoyer des messages"), ("embed_links", "Intégrer des liens"),
+        ("attach_files", "Joindre des fichiers"), ("read_message_history", "Voir les anciens messages"),
+    ]
+    if not FM_PANEL_FOLLOWS:
+        needed.append(("manage_messages", "Gérer les messages (épingler le panneau)"))
+    for attr, label in needed:
+        ok = base.administrator or getattr(base, attr)
+        lines.append(f"{'✅' if ok else '❌'} {label}")
+    for key, title in (("category_id", "Forgemagie"), ("archive_category_id", "Archives FM")):
+        category = fm_place(guild, key, discord.CategoryChannel)
+        if category is None:
+            lines.append(f"⚠️ Catégorie {title} introuvable (le bot la crée au besoin).")
+            continue
+        perms = category.permissions_for(me)
+        ok = perms.administrator or (perms.manage_channels and perms.view_channel)
+        lines.append(f"{'✅' if ok else '❌'} Catégorie « {category.name} » : Gérer les salons"
+                     f" ({len(category.channels)}/50 salons)")
+        if len(category.channels) >= 50:
+            lines.append("❌ Cette catégorie est pleine (limite Discord : 50 salons).")
+    return "\n".join(lines)
+
+@bot.command()
+async def droits(ctx):
+    perms = getattr(ctx.author, "guild_permissions", None)
+    if not (perms and perms.administrator):
+        return await ctx.send("Commande réservée aux administrateurs du serveur.")
+    if ctx.guild is None:
+        return await ctx.send("À utiliser sur le serveur.")
+    await ctx.send("**Droits du bot pour les salons FM**\n" + permission_report(ctx.guild))
 
 # ---------------- TACHES DE FOND ---------------- #
 # Toutes les 10 secondes : les demandes du site (ouvrir / fermer une session,
